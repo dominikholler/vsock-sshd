@@ -1,0 +1,21 @@
+[Unit]
+Description=Minimal VM SSH/SFTP Server (per-connection vsock stdio instance)
+After=systemd-user-sessions.service
+
+[Service]
+# systemd forwards the accepted AF_VSOCK connection directly to fd 0 / fd 1
+ExecStart=/usr/local/sbin/vsock-sshd -i --host-key /etc/vsock-sshd/ssh_host_ed25519_key
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+KillMode=process
+Restart=no
+
+# Baseline hardening while preserving setresuid/setresgid/initgroups for impersonation
+NoNewPrivileges=no
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_VSOCK AF_UNIX

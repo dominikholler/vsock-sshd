@@ -1,0 +1,53 @@
+[package]
+name = "vsock-sshd"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal inetd/vsock SSH & privilege-separated SFTP server for Linux and Windows VMs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "vsock-sshd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+russh = "0.51"
+russh-sftp = "2.1"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"

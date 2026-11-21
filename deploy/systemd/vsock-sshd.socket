@@ -1,0 +1,12 @@
+[Unit]
+Description=Minimal VM SSH/SFTP Server over Virtio VSOCK
+ConditionVirtualization=vm
+
+[Socket]
+# Systemd AF_VSOCK socket activation
+ListenStream=vsock::22
+Accept=yes
+MaxConnectionsPerSource=16
+
+[Install]
+WantedBy=sockets.target
