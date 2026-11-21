@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client;
-use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct ChildStream {
@@ -54,7 +54,7 @@ impl client::Handler for TestClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -77,7 +77,7 @@ async fn e2e_binary_ssh_command_execution() {
     let auth_keys_path = tmp_dir.path().join("authorized_keys");
 
     // 1. Generate temporary client Ed25519 keypair
-    let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+    let mut rng = rand::rng();
     let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
     let client_pub = client_key.public_key();
     let client_pub_openssh = client_pub.to_openssh().expect("encode public key");
@@ -188,7 +188,7 @@ async fn e2e_openssh_client_command_execution() {
     let client_key_path = tmp_dir.path().join("id_ed25519");
 
     // Generate client keypair
-    let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+    let mut rng = rand::rng();
     let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
     let client_priv_openssh = client_key
         .to_openssh(russh::keys::ssh_key::LineEnding::LF)

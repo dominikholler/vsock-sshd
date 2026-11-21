@@ -148,7 +148,7 @@ fn load_or_create_host_key(path: &PathBuf) -> Result<PrivateKey> {
     }
 
     info!(path = %path.display(), "generating new Ed25519 host key");
-    let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+    let mut rng = rand::rng();
     let key = PrivateKey::random(&mut rng, Algorithm::Ed25519)
         .context("failed to generate Ed25519 host key")?;
     let pem = key

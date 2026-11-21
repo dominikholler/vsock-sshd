@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client;
-use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use russh::{MethodKind, MethodSet};
 use vsock_sshd::server::SshSession;
 
@@ -13,14 +13,14 @@ impl client::Handler for TestClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
 
 fn build_server_config() -> Arc<russh::server::Config> {
-    let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+    let mut rng = rand::rng();
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key");
 
     let cfg = russh::server::Config {
@@ -65,7 +65,7 @@ async fn rejects_password_none_and_unauthorized_public_key() {
     assert!(!pw_res.success(), "password auth must be rejected");
 
     // 3. Unauthorized Ed25519 key must be rejected
-    let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+    let mut rng = rand::rng();
     let random_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client key");
     let key_res = handle
         .authenticate_publickey(
