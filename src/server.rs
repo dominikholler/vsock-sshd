@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
+use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -99,11 +98,7 @@ impl SshSession {
                 match stdout.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        if out_handle
-                            .data(channel, CryptoVec::from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
+                        if out_handle.data(channel, buf[..n].to_vec()).await.is_err() {
                             break;
                         }
                     }
@@ -122,7 +117,7 @@ impl SshSession {
                     Ok(n) => {
                         if forward_stderr {
                             if err_handle
-                                .extended_data(channel, 1, CryptoVec::from_slice(&buf[..n]))
+                                .extended_data(channel, 1, buf[..n].to_vec())
                                 .await
                                 .is_err()
                             {
@@ -177,11 +172,11 @@ impl Handler for SshSession {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        public_key: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         if auth::authorize_public_key_with_path(
             user,
-            public_key,
+            public_key.public_key,
             self.authorized_keys_path.as_deref(),
         )
         .is_some()
@@ -195,17 +190,17 @@ impl Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         match auth::authorize_public_key_with_path(
             user,
-            public_key,
+            public_key.public_key,
             self.authorized_keys_path.as_deref(),
         ) {
             Some(os_user) => {
                 info!(
                     user = %os_user.username,
-                    fingerprint = %public_key.fingerprint(Default::default()),
+                    fingerprint = %public_key.public_key.fingerprint(Default::default()),
                     "authenticated OS user via public key"
                 );
                 self.user = Some(os_user);
@@ -223,14 +218,19 @@ impl Handler for SshSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         if self.user.is_none() {
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
         self.channels
             .insert(channel.id(), ActiveChannel { stdin_tx: None });
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     // Explicitly disallow interactive terminals, shells, X11, and port forwarding.

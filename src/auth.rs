@@ -111,7 +111,7 @@ mod tests {
     use russh::keys::{Algorithm, PrivateKey};
 
     fn gen_key() -> PublicKey {
-        let mut rng = russh::keys::ssh_key::rand_core::OsRng;
+        let mut rng = rand::rng();
         PrivateKey::random(&mut rng, Algorithm::Ed25519)
             .expect("ed25519 keygen")
             .public_key()
