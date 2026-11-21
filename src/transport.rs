@@ -124,7 +124,7 @@ mod unix_socket {
         }
 
         Ok(Some(AsyncSocketFd {
-            inner: AsyncFd::new(owned)?,
+            inner: unsafe { AsyncFd::register(owned)? },
         }))
     }
 

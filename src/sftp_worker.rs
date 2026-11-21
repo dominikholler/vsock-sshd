@@ -27,8 +27,14 @@ const MAX_OPEN_HANDLES: usize = 256;
 const MAX_READDIR_BATCH: usize = 64;
 
 enum HandleEntry {
-    File { file: File, path: PathBuf },
-    Dir { entries: Vec<(String, PathBuf)>, offset: usize },
+    File {
+        file: File,
+        path: PathBuf,
+    },
+    Dir {
+        entries: Vec<(String, PathBuf)>,
+        offset: usize,
+    },
 }
 
 struct WorkerHandler {
@@ -307,7 +313,10 @@ impl Handler for WorkerHandler {
         let dest = fs::read_link(resolve_sftp_path(&path)).map_err(io_to_status)?;
         Ok(Name {
             id,
-            files: vec![SftpFile::new(to_sftp_path(&dest), FileAttributes::default())],
+            files: vec![SftpFile::new(
+                to_sftp_path(&dest),
+                FileAttributes::default(),
+            )],
         })
     }
 
@@ -418,9 +427,10 @@ fn resolve_sftp_path(raw: &str) -> PathBuf {
         // Translate OpenSSH SFTP Windows paths (`/C:/Users/...`) to native `C:\Users\...`.
         let b = raw.as_bytes();
         if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
-            return PathBuf::from(raw[1..].replace('/', "\\"));
+            PathBuf::from(raw[1..].replace('/', "\\"))
+        } else {
+            PathBuf::from(raw.replace('/', "\\"))
         }
-        return PathBuf::from(raw.replace('/', "\\"));
     }
 
     #[cfg(unix)]
@@ -460,10 +470,7 @@ mod tests {
             io_to_status(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
             StatusCode::PermissionDenied
         );
-        assert_eq!(
-            io_to_status(io::Error::new(io::ErrorKind::Other, "boom")),
-            StatusCode::Failure
-        );
+        assert_eq!(io_to_status(io::Error::other("boom")), StatusCode::Failure);
     }
 
     #[test]
@@ -496,7 +503,12 @@ mod tests {
         let mut handler = WorkerHandler::new();
         for id in 0..MAX_OPEN_HANDLES {
             handler
-                .open(id as u32, path_str.clone(), OpenFlags::READ, FileAttributes::default())
+                .open(
+                    id as u32,
+                    path_str.clone(),
+                    OpenFlags::READ,
+                    FileAttributes::default(),
+                )
                 .await
                 .expect("open within cap");
         }
@@ -508,4 +520,3 @@ mod tests {
         assert_eq!(err, StatusCode::Failure);
     }
 }
-

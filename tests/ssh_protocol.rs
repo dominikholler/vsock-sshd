@@ -23,11 +23,13 @@ fn build_server_config() -> Arc<russh::server::Config> {
     let mut rng = russh::keys::ssh_key::rand_core::OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key");
 
-    let mut cfg = russh::server::Config::default();
-    cfg.keys = vec![host_key];
-    cfg.methods = MethodSet::from(&[MethodKind::PublicKey][..]);
-    cfg.auth_rejection_time = Duration::from_millis(10);
-    cfg.auth_rejection_time_initial = Some(Duration::from_millis(0));
+    let cfg = russh::server::Config {
+        keys: vec![host_key],
+        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
+        auth_rejection_time: Duration::from_millis(10),
+        auth_rejection_time_initial: Some(Duration::from_millis(0)),
+        ..Default::default()
+    };
     Arc::new(cfg)
 }
 
