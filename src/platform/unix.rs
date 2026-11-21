@@ -218,7 +218,8 @@ fn spawn_impersonated(
 
     unsafe {
         cmd.pre_exec(move || {
-            if libc::initgroups(c_user.as_ptr(), gid as libc::gid_t) != 0 {
+            // Only root can change supplementary groups via initgroups.
+            if libc::geteuid() == 0 && libc::initgroups(c_user.as_ptr(), gid as libc::gid_t) != 0 {
                 return Err(io::Error::last_os_error());
             }
 

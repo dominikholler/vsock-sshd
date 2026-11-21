@@ -6,6 +6,16 @@ use crate::platform::{self, OsUser};
 /// Verify that `username` is a valid system OS account and that `presented`
 /// matches a key in the user's strictly permission-checked `authorized_keys`.
 pub fn authorize_public_key(username: &str, presented: &PublicKey) -> Option<OsUser> {
+    authorize_public_key_with_path(username, presented, None)
+}
+
+/// Verify public key against `custom_path` if provided, otherwise falling back
+/// to the user's strictly permission-checked `authorized_keys`.
+pub fn authorize_public_key_with_path(
+    username: &str,
+    presented: &PublicKey,
+    custom_path: Option<&std::path::Path>,
+) -> Option<OsUser> {
     let user = match platform::lookup_user(username) {
         Ok(Some(u)) => u,
         Ok(None) => {
@@ -18,20 +28,29 @@ pub fn authorize_public_key(username: &str, presented: &PublicKey) -> Option<OsU
         }
     };
 
-    let raw_keys = match platform::read_authorized_keys_strict(&user) {
-        Ok(Some(contents)) => contents,
-        Ok(None) => {
-            debug!(user = username, "no authorized_keys file found");
-            return None;
-        }
-        Err(err) => {
-            warn!(
-                user = username,
-                error = %err,
-                "rejected authorized_keys due to security check"
-            );
-            return None;
-        }
+    let raw_keys = match custom_path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "failed to read custom authorized_keys");
+                return None;
+            }
+        },
+        None => match platform::read_authorized_keys_strict(&user) {
+            Ok(Some(contents)) => contents,
+            Ok(None) => {
+                debug!(user = username, "no authorized_keys file found");
+                return None;
+            }
+            Err(err) => {
+                warn!(
+                    user = username,
+                    error = %err,
+                    "rejected authorized_keys due to security check"
+                );
+                return None;
+            }
+        },
     };
 
     for line in raw_keys.lines() {

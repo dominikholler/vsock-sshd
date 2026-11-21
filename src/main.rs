@@ -13,19 +13,23 @@ const USAGE: &str = "\
 vsock-sshd — minimal VM SSH/SFTP server (inetd / systemd vsock stdio mode)
 
 USAGE:
-    vsock-sshd [-i] [--host-key <PATH>]
+    vsock-sshd [-i] [--host-key <PATH>] [--authorized-keys <PATH>]
     vsock-sshd --internal-sftp
 
 OPTIONS:
     -i, --inetd           Run single SSH session over stdin/stdout (default)
     --host-key <PATH>     Path to OpenSSH Ed25519 host private key
+    --authorized-keys <PATH> Path to OpenSSH authorized_keys file
     --internal-sftp       Run unprivileged SFTP v3 worker over stdin/stdout
     -h, --help            Print help
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
-    Daemon { host_key: PathBuf },
+    Daemon {
+        host_key: PathBuf,
+        authorized_keys: Option<PathBuf>,
+    },
     InternalSftp,
     Help,
 }
@@ -36,6 +40,7 @@ where
     S: AsRef<str>,
 {
     let mut host_key: Option<PathBuf> = None;
+    let mut authorized_keys: Option<PathBuf> = None;
     let mut args = iter.into_iter();
 
     while let Some(arg) = args.next() {
@@ -46,6 +51,12 @@ where
                 let p = args.next().context("--host-key requires a path argument")?;
                 host_key = Some(PathBuf::from(p.as_ref()));
             }
+            "--authorized-keys" => {
+                let p = args
+                    .next()
+                    .context("--authorized-keys requires a path argument")?;
+                authorized_keys = Some(PathBuf::from(p.as_ref()));
+            }
             "-h" | "--help" => return Ok(Mode::Help),
             other => bail!("unknown argument: {other}\n\n{USAGE}"),
         }
@@ -53,6 +64,8 @@ where
 
     Ok(Mode::Daemon {
         host_key: host_key.unwrap_or_else(platform::default_host_key_path),
+        authorized_keys: authorized_keys
+            .or_else(|| std::env::var_os("VSOCK_SSHD_AUTHORIZED_KEYS").map(PathBuf::from)),
     })
 }
 
@@ -68,7 +81,10 @@ fn main() -> Result<()> {
         Mode::InternalSftp => sftp_worker::run(),
 
         // Privileged inetd / systemd-vsock daemon mode (one process per connection).
-        Mode::Daemon { host_key } => {
+        Mode::Daemon {
+            host_key,
+            authorized_keys,
+        } => {
             // Log exclusively to stderr so stdout remains a clean binary SSH stream.
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
@@ -85,12 +101,12 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build tokio runtime")?;
 
-            rt.block_on(run_daemon(host_key))
+            rt.block_on(run_daemon(host_key, authorized_keys))
         }
     }
 }
 
-async fn run_daemon(host_key_path: PathBuf) -> Result<()> {
+async fn run_daemon(host_key_path: PathBuf, authorized_keys_path: Option<PathBuf>) -> Result<()> {
     let host_key = load_or_create_host_key(&host_key_path)
         .with_context(|| format!("failed to load host key at {}", host_key_path.display()))?;
 
@@ -110,7 +126,7 @@ async fn run_daemon(host_key_path: PathBuf) -> Result<()> {
 
     info!("starting vsock-sshd session on stdio transport");
 
-    let handler = server::SshSession::new();
+    let handler = server::SshSession::with_authorized_keys(authorized_keys_path);
     match russh::server::run_stream(Arc::new(config), stream, handler).await {
         Ok(session) => {
             if let Err(err) = session.await {
@@ -152,13 +168,29 @@ mod tests {
         assert_eq!(
             parse_args_from::<[&str; 0], _>([]).unwrap(),
             Mode::Daemon {
-                host_key: platform::default_host_key_path()
+                host_key: platform::default_host_key_path(),
+                authorized_keys: None,
             }
         );
         assert_eq!(
             parse_args_from(["-i", "--host-key", "/tmp/host_key"]).unwrap(),
             Mode::Daemon {
-                host_key: PathBuf::from("/tmp/host_key")
+                host_key: PathBuf::from("/tmp/host_key"),
+                authorized_keys: None,
+            }
+        );
+        assert_eq!(
+            parse_args_from([
+                "-i",
+                "--host-key",
+                "/tmp/host_key",
+                "--authorized-keys",
+                "/tmp/auth_keys"
+            ])
+            .unwrap(),
+            Mode::Daemon {
+                host_key: PathBuf::from("/tmp/host_key"),
+                authorized_keys: Some(PathBuf::from("/tmp/auth_keys")),
             }
         );
     }
