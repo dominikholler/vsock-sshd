@@ -9,26 +9,25 @@ use std::ptr::{null, null_mut};
 
 use anyhow::{bail, Context, Result};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, BOOL, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LUID, NTSTATUS, SetHandleInformation, TRUE,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, FALSE, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, NTSTATUS, TRUE,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetLocalGroups, LG_INCLUDE_INDIRECT, LOCALGROUP_USERS_INFO_0,
     MAX_PREFERRED_LENGTH,
 };
 use windows_sys::Win32::Security::Authentication::Identity::{
-    LsaConnectUntrusted, LsaDeregisterLogonProcess, LsaFreeReturnBuffer,
-    LsaLookupAuthenticationPackage, LsaLogonUser, LsaRegisterLogonProcess,
-    LSA_OPERATIONAL_MODE, LSA_STRING, MSV1_0_S4U_LOGON, MSV1_0_S4U_LOGON_FLAG_CHECK_LOGONHOURS,
-    MsV1_0S4ULogon, Network, QUOTA_LIMITS, TOKEN_SOURCE,
+    LsaConnectUntrusted, LsaDeregisterLogonProcess, LsaFreeReturnBuffer, LsaLogonUser,
+    LsaLookupAuthenticationPackage, LsaRegisterLogonProcess, MsV1_0S4ULogon, LSA_STRING,
+    MSV1_0_S4U_LOGON, MSV1_0_S4U_LOGON_FLAG_CHECK_LOGONHOURS, SECURITY_LOGON_TYPE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, EqualSid, IsWellKnownSid, LookupAccountNameW, SecurityImpersonation,
-    TokenPrimary, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
-    PSID, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_ALL_ACCESS,
+    TokenPrimary, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSID,
+    QUOTA_LIMITS, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_ALL_ACCESS, TOKEN_SOURCE,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::System::Environment::{
@@ -141,6 +140,7 @@ pub fn lookup_user(username: &str) -> Result<Option<OsUser>> {
 /// OpenSSH-Win32 strict `authorized_keys` resolution:
 /// - Administrators use `%ProgramData%\ssh\administrators_authorized_keys`
 /// - Standard users use `<ProfileDir>\.ssh\authorized_keys`
+///
 /// Refuses reparse points (symlinks/junctions) and verifies file owner SID.
 pub fn read_authorized_keys_strict(user: &OsUser) -> Result<Option<String>> {
     let key_path = if user.is_admin {
@@ -200,8 +200,8 @@ fn verify_owner_sid(handle: HANDLE, user: &OsUser) -> Result<()> {
     let trusted = unsafe {
         let is_system = IsWellKnownSid(owner_sid, WinLocalSystemSid) != FALSE;
         let is_admins = IsWellKnownSid(owner_sid, WinBuiltinAdministratorsSid) != FALSE;
-        let is_user = !user.is_admin
-            && EqualSid(owner_sid, user.sid_bytes.as_ptr() as PSID) != FALSE;
+        let is_user =
+            !user.is_admin && EqualSid(owner_sid, user.sid_bytes.as_ptr() as PSID) != FALSE;
         is_system || is_admins || is_user
     };
 
@@ -234,11 +234,7 @@ pub fn spawn_internal_sftp(user: &OsUser) -> Result<SpawnedChild> {
 ///
 /// Requires the daemon service to run as `NT AUTHORITY\SYSTEM` (matching
 /// OpenSSH-Win32). Strictly fail-closed: never falls back to SYSTEM.
-fn spawn_as_user(
-    user: &OsUser,
-    application: Option<&Path>,
-    cmdline: &str,
-) -> Result<SpawnedChild> {
+fn spawn_as_user(user: &OsUser, application: Option<&Path>, cmdline: &str) -> Result<SpawnedChild> {
     let primary_token = acquire_s4u_primary_token(user)
         .context("strict Windows S4U2Self user token acquisition failed")?;
 
@@ -248,14 +244,17 @@ fn spawn_as_user(
 
     let mut env_block: *mut c_void = null_mut();
     unsafe {
-        if CreateEnvironmentBlock(&mut env_block, primary_token.as_raw_handle() as HANDLE, FALSE)
-            == FALSE
+        if CreateEnvironmentBlock(
+            &mut env_block,
+            primary_token.as_raw_handle() as HANDLE,
+            FALSE,
+        ) == FALSE
         {
             env_block = null_mut();
         }
     }
 
-    let app_wide = application.map(|p| to_wide(p));
+    let app_wide = application.map(to_wide);
     let mut cmd_wide = to_wide(cmdline);
     let cwd_wide = to_wide(&user.home);
 
@@ -335,7 +334,7 @@ fn spawn_as_user(
 /// primary `HANDLE` token suitable for `CreateProcessAsUserW`.
 fn acquire_s4u_primary_token(user: &OsUser) -> Result<OwnedHandle> {
     let mut lsa_handle: HANDLE = null_mut();
-    let mut mode: LSA_OPERATIONAL_MODE = 0;
+    let mut mode: u32 = 0;
 
     let proc_name = b"vsock-sshd";
     let lsa_proc = LSA_STRING {
@@ -344,7 +343,8 @@ fn acquire_s4u_primary_token(user: &OsUser) -> Result<OwnedHandle> {
         Buffer: proc_name.as_ptr() as *mut _,
     };
 
-    let status: NTSTATUS = unsafe { LsaRegisterLogonProcess(&lsa_proc, &mut lsa_handle, &mut mode) };
+    let status: NTSTATUS =
+        unsafe { LsaRegisterLogonProcess(&lsa_proc, &mut lsa_handle, &mut mode) };
     if status != 0 {
         // Fallback when TCB is held via service context without interactive logon registration.
         let status2 = unsafe { LsaConnectUntrusted(&mut lsa_handle) };
@@ -400,13 +400,19 @@ fn acquire_s4u_primary_token(user: &OsUser) -> Result<OwnedHandle> {
         Buffer: origin_name.as_ptr() as *mut _,
     };
     let token_source = TOKEN_SOURCE {
-        SourceName: *b"vsockssh",
-        SourceIdentifier: LUID { LowPart: 1, HighPart: 0 },
+        SourceName: (*b"vsockssh").map(|b| b as i8),
+        SourceIdentifier: LUID {
+            LowPart: 1,
+            HighPart: 0,
+        },
     };
 
     let mut profile_buf: *mut c_void = null_mut();
     let mut profile_len: u32 = 0;
-    let mut logon_id = LUID { LowPart: 0, HighPart: 0 };
+    let mut logon_id = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
     let mut raw_token: HANDLE = null_mut();
     let mut quotas: QUOTA_LIMITS = unsafe { std::mem::zeroed() };
     let mut sub_status: NTSTATUS = 0;
@@ -415,7 +421,7 @@ fn acquire_s4u_primary_token(user: &OsUser) -> Result<OwnedHandle> {
         LsaLogonUser(
             lsa_handle,
             &origin,
-            Network,
+            SECURITY_LOGON_TYPE::Network,
             auth_pkg,
             buf.as_ptr().cast(),
             buf.len() as u32,
@@ -466,14 +472,14 @@ fn acquire_s4u_primary_token(user: &OsUser) -> Result<OwnedHandle> {
 
 /// Create an anonymous pipe where ONLY the child end is inheritable.
 fn create_pipe_pair(child_is_read: bool) -> Result<(OwnedHandle, OwnedHandle)> {
-    let mut sa = SECURITY_ATTRIBUTES {
+    let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: null_mut(),
         bInheritHandle: TRUE,
     };
     let mut read_h: HANDLE = null_mut();
     let mut write_h: HANDLE = null_mut();
-    if unsafe { CreatePipe(&mut read_h, &mut write_h, &mut sa, 0) } == FALSE {
+    if unsafe { CreatePipe(&mut read_h, &mut write_h, &sa, 0) } == FALSE {
         bail!("CreatePipe failed");
     }
 
@@ -518,10 +524,8 @@ fn is_local_administrator(username: &str) -> bool {
 
     let mut found = false;
     unsafe {
-        let slice = std::slice::from_raw_parts(
-            buf as *const LOCALGROUP_USERS_INFO_0,
-            entries as usize,
-        );
+        let slice =
+            std::slice::from_raw_parts(buf as *const LOCALGROUP_USERS_INFO_0, entries as usize);
         for item in slice {
             if !item.lgrui0_name.is_null() {
                 let mut len = 0;
@@ -543,7 +547,7 @@ fn is_local_administrator(username: &str) -> bool {
 }
 
 fn lookup_profile_dir(sid_string: &str) -> Option<PathBuf> {
-    let subkey = to_wide(&format!(
+    let subkey = to_wide(format!(
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid_string}"
     ));
     let value_name = to_wide("ProfileImagePath");

@@ -60,7 +60,10 @@ async fn sftp_roundtrip_file_and_directory_lifecycle() {
 
     // Missing file returns error
     let missing = root.join("does-not-exist.txt");
-    assert!(sftp.metadata(missing.to_string_lossy().as_ref()).await.is_err());
+    assert!(sftp
+        .metadata(missing.to_string_lossy().as_ref())
+        .await
+        .is_err());
 
     // REMOVE + RMDIR
     sftp.remove_file(&moved_str).await.expect("remove file");

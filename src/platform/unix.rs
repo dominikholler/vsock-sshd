@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -148,7 +148,7 @@ pub fn read_authorized_keys_strict(user: &OsUser) -> Result<Option<String>> {
     }
 
     let mut contents = String::new();
-    let mut reader = File::from(file);
+    let mut reader = file;
     reader.read_to_string(&mut contents)?;
     Ok(Some(contents))
 }
@@ -356,10 +356,12 @@ mod tests {
         let key_path = tmp.path().join("keys").join("ssh_host_ed25519_key");
         write_host_key_strict(&key_path, b"dummy-host-key").unwrap();
 
-        let dir_mode = std::fs::metadata(key_path.parent().unwrap()).unwrap().mode() & 0o777;
+        let dir_mode = std::fs::metadata(key_path.parent().unwrap())
+            .unwrap()
+            .mode()
+            & 0o777;
         let file_mode = std::fs::metadata(&key_path).unwrap().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
     }
 }
-

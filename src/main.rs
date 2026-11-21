@@ -94,14 +94,16 @@ async fn run_daemon(host_key_path: PathBuf) -> Result<()> {
     let host_key = load_or_create_host_key(&host_key_path)
         .with_context(|| format!("failed to load host key at {}", host_key_path.display()))?;
 
-    let mut config = russh::server::Config::default();
-    config.server_id = russh::SshId::Standard("SSH-2.0-vsock-sshd".into());
-    config.keys = vec![host_key];
-    config.methods = MethodSet::from(&[MethodKind::PublicKey][..]);
-    config.auth_rejection_time = Duration::from_millis(250);
-    config.auth_rejection_time_initial = Some(Duration::from_millis(0));
-    config.inactivity_timeout = Some(Duration::from_secs(600));
-    config.max_auth_attempts = 6;
+    let config = russh::server::Config {
+        server_id: russh::SshId::Standard("SSH-2.0-vsock-sshd".into()),
+        keys: vec![host_key],
+        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
+        auth_rejection_time: Duration::from_millis(250),
+        auth_rejection_time_initial: Some(Duration::from_millis(0)),
+        inactivity_timeout: Some(Duration::from_secs(600)),
+        max_auth_attempts: 6,
+        ..Default::default()
+    };
 
     let stream = transport::StdioTransport::from_stdio()
         .context("failed to initialize stdio/vsock transport")?;

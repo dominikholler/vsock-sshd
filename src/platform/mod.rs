@@ -28,7 +28,7 @@ pub struct SpawnedChild {
     pub stdin: BoxAsyncWrite,
     pub stdout: BoxAsyncRead,
     pub stderr: BoxAsyncRead,
-    wait_fn: Pin<Box<dyn std::future::Future<Output = u32> + Send>>,
+    pub wait_fn: Pin<Box<dyn std::future::Future<Output = u32> + Send>>,
 }
 
 impl SpawnedChild {

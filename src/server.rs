@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use russh::server::{Auth, Handler, Msg, PublicKeyOffer, Session, VerifiedPublicKey};
+use russh::keys::PublicKey;
+use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -40,11 +41,19 @@ impl SshSession {
             channels: HashMap::new(),
         }
     }
+}
 
+impl Default for SshSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SshSession {
     fn wire_child(
         &mut self,
         channel: ChannelId,
-        mut spawned: SpawnedChild,
+        spawned: SpawnedChild,
         session: &mut Session,
         forward_stderr: bool,
     ) {
@@ -55,15 +64,21 @@ impl SshSession {
             entry.stdin_tx = Some(stdin_tx);
         }
 
+        let SpawnedChild {
+            mut stdin,
+            mut stdout,
+            mut stderr,
+            wait_fn,
+        } = spawned;
+
         // Pump SSH channel data -> child stdin.
-        let mut child_stdin = spawned.stdin;
         tokio::spawn(async move {
             while let Some(chunk) = stdin_rx.recv().await {
-                if child_stdin.write_all(&chunk).await.is_err() {
+                if stdin.write_all(&chunk).await.is_err() {
                     break;
                 }
             }
-            let _ = child_stdin.shutdown().await;
+            let _ = stdin.shutdown().await;
         });
 
         // Pump child stdout -> SSH channel data.
@@ -71,7 +86,7 @@ impl SshSession {
         let stdout_task = tokio::spawn(async move {
             let mut buf = vec![0u8; IO_CHUNK_SIZE];
             loop {
-                match spawned.stdout.read(&mut buf).await {
+                match stdout.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
                         if out_handle
@@ -92,7 +107,7 @@ impl SshSession {
         let stderr_task = tokio::spawn(async move {
             let mut buf = vec![0u8; IO_CHUNK_SIZE];
             loop {
-                match spawned.stderr.read(&mut buf).await {
+                match stderr.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
                         if forward_stderr {
@@ -115,7 +130,7 @@ impl SshSession {
 
         // Wait for child exit & stream drain, then report exit status + EOF + close.
         tokio::spawn(async move {
-            let code = spawned.wait_exit_code().await;
+            let code = wait_fn.await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             let _ = handle.exit_status_request(channel, code).await;
@@ -152,9 +167,9 @@ impl Handler for SshSession {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        offer: PublicKeyOffer<'_>,
+        public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if auth::authorize_public_key(user, offer.public_key()).is_some() {
+        if auth::authorize_public_key(user, public_key).is_some() {
             Ok(Auth::Accept)
         } else {
             Ok(reject_to_pubkey())
@@ -164,13 +179,13 @@ impl Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        key: VerifiedPublicKey<'_>,
+        public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        match auth::authorize_public_key(user, key.public_key()) {
+        match auth::authorize_public_key(user, public_key) {
             Some(os_user) => {
                 info!(
                     user = %os_user.username,
-                    fingerprint = %key.public_key().fingerprint(Default::default()),
+                    fingerprint = %public_key.fingerprint(Default::default()),
                     "authenticated OS user via public key"
                 );
                 self.user = Some(os_user);
