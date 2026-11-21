@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use anyhow::{bail, Context, Result};
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, FALSE, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, NTSTATUS, TRUE,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, LUID, NTSTATUS, TRUE,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetLocalGroups, LG_INCLUDE_INDIRECT, LOCALGROUP_USERS_INFO_0,
