@@ -32,6 +32,7 @@ struct ActiveChannel {
 pub struct SshSession {
     user: Option<OsUser>,
     channels: HashMap<ChannelId, ActiveChannel>,
+    authorized_keys_path: Option<std::path::PathBuf>,
 }
 
 impl SshSession {
@@ -39,6 +40,15 @@ impl SshSession {
         Self {
             user: None,
             channels: HashMap::new(),
+            authorized_keys_path: None,
+        }
+    }
+
+    pub fn with_authorized_keys(path: Option<std::path::PathBuf>) -> Self {
+        Self {
+            user: None,
+            channels: HashMap::new(),
+            authorized_keys_path: path,
         }
     }
 }
@@ -169,7 +179,13 @@ impl Handler for SshSession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if auth::authorize_public_key(user, public_key).is_some() {
+        if auth::authorize_public_key_with_path(
+            user,
+            public_key,
+            self.authorized_keys_path.as_deref(),
+        )
+        .is_some()
+        {
             Ok(Auth::Accept)
         } else {
             Ok(reject_to_pubkey())
@@ -181,7 +197,11 @@ impl Handler for SshSession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        match auth::authorize_public_key(user, public_key) {
+        match auth::authorize_public_key_with_path(
+            user,
+            public_key,
+            self.authorized_keys_path.as_deref(),
+        ) {
             Some(os_user) => {
                 info!(
                     user = %os_user.username,
