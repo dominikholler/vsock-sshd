@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use russh_sftp::protocol::{
-    Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
-    Version,
+    Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, SftpHandle, Status,
+    StatusCode, Version,
 };
 use russh_sftp::server::Handler;
 
@@ -38,7 +38,7 @@ enum HandleEntry {
 }
 
 struct WorkerHandler {
-    handles: HashMap<String, HandleEntry>,
+    handles: HashMap<SftpHandle, HandleEntry>,
     next_handle: u64,
 }
 
@@ -50,10 +50,10 @@ impl WorkerHandler {
         }
     }
 
-    fn alloc_handle(&mut self) -> String {
+    fn alloc_handle(&mut self) -> SftpHandle {
         let id = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1);
-        format!("h{id:x}")
+        format!("h{id:x}").into()
     }
 }
 
@@ -125,7 +125,7 @@ impl Handler for WorkerHandler {
         })
     }
 
-    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+    async fn fstat(&mut self, id: u32, handle: SftpHandle) -> Result<Attrs, Self::Error> {
         let Some(HandleEntry::File { file, .. }) = self.handles.get(&handle) else {
             return Err(StatusCode::Failure);
         };
@@ -172,7 +172,7 @@ impl Handler for WorkerHandler {
     async fn read(
         &mut self,
         id: u32,
-        handle: String,
+        handle: SftpHandle,
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
@@ -194,7 +194,7 @@ impl Handler for WorkerHandler {
     async fn write(
         &mut self,
         id: u32,
-        handle: String,
+        handle: SftpHandle,
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
@@ -225,7 +225,7 @@ impl Handler for WorkerHandler {
         Ok(Handle { id, handle })
     }
 
-    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+    async fn readdir(&mut self, id: u32, handle: SftpHandle) -> Result<Name, Self::Error> {
         let Some(HandleEntry::Dir { entries, offset }) = self.handles.get_mut(&handle) else {
             return Err(StatusCode::Failure);
         };
@@ -248,7 +248,7 @@ impl Handler for WorkerHandler {
         Ok(Name { id, files })
     }
 
-    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+    async fn close(&mut self, id: u32, handle: SftpHandle) -> Result<Status, Self::Error> {
         self.handles
             .remove(&handle)
             .map(|_| ok_status(id))
@@ -299,7 +299,7 @@ impl Handler for WorkerHandler {
     async fn fsetstat(
         &mut self,
         id: u32,
-        handle: String,
+        handle: SftpHandle,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
         let Some(HandleEntry::File { path, .. }) = self.handles.get(&handle) else {
