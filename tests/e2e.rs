@@ -243,6 +243,62 @@ async fn e2e_openssh_client_command_execution() {
     assert_eq!(stdout_str.trim(), "hello from openssh client");
 }
 
+/// Quotes a path operand for OpenSSH sftp batch commands.
+/// OpenSSH sftp parses batch commands using `makeargv` where double-quoted
+/// strings unescape `\"` and `\\`, and then `glob(3)` / `undo_glob_escape` unescapes `\\`.
+fn sftp_quote_operand(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Quotes a path for POSIX shell argument string inside double quotes.
+fn sh_quote_in_double_quotes(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' | '$' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Quotes a string for POSIX shell or Python shlex.split using single quotes.
+fn shlex_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[tokio::test]
 async fn e2e_openssh_sftp_file_transfer() {
     let sftp_check = std::process::Command::new("sftp").arg("-V").output();
@@ -252,7 +308,10 @@ async fn e2e_openssh_sftp_file_transfer() {
     }
 
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
-    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("sftp test spaces ")
+        .tempdir()
+        .expect("create tempdir");
     let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
     let auth_keys_path = tmp_dir.path().join("authorized_keys");
     let client_key_path = tmp_dir.path().join("id_ed25519");
@@ -279,25 +338,37 @@ async fn e2e_openssh_sftp_file_transfer() {
     std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
         .expect("write authorized_keys");
 
-    let local_file = tmp_dir.path().join("local.txt");
-    let remote_file = tmp_dir.path().join("remote.txt");
-    let downloaded_file = tmp_dir.path().join("downloaded.txt");
+    let local_file = tmp_dir.path().join(if cfg!(windows) {
+        "local file with spaces.txt"
+    } else {
+        "local \"file\" with \\backslash\\ and spaces.txt"
+    });
+    let remote_file = tmp_dir.path().join(if cfg!(windows) {
+        "remote file with spaces.txt"
+    } else {
+        "remote \"file\" with \\backslash\\ and spaces.txt"
+    });
+    let downloaded_file = tmp_dir.path().join(if cfg!(windows) {
+        "downloaded file with spaces.txt"
+    } else {
+        "downloaded \"file\" with \\backslash\\ and spaces.txt"
+    });
     std::fs::write(&local_file, b"sftp roundtrip verification").expect("write local file");
 
     let username = get_current_username();
     let proxy_cmd = format!(
-        "\"{}\" -i --host-key \"{}\" --authorized-keys \"{}\"",
-        binary_path.display(),
-        host_key_path.display(),
-        auth_keys_path.display()
+        "{} -i --host-key {} --authorized-keys {}",
+        sh_quote_in_double_quotes(&binary_path),
+        sh_quote_in_double_quotes(&host_key_path),
+        sh_quote_in_double_quotes(&auth_keys_path)
     );
 
     let batch_cmds = format!(
-        "put \"{}\" \"{}\"\nget \"{}\" \"{}\"\n",
-        local_file.display(),
-        remote_file.display(),
-        remote_file.display(),
-        downloaded_file.display()
+        "put {} {}\nget {} {}\n",
+        sftp_quote_operand(&local_file),
+        sftp_quote_operand(&remote_file),
+        sftp_quote_operand(&remote_file),
+        sftp_quote_operand(&downloaded_file)
     );
 
     let mut child = tokio::process::Command::new("sftp")
@@ -349,7 +420,10 @@ async fn e2e_ansible_ping_and_command_execution() {
     }
 
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
-    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("ansible test spaces ")
+        .tempdir()
+        .expect("create tempdir");
     let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
     let auth_keys_path = tmp_dir.path().join("authorized_keys");
     let client_key_path = tmp_dir.path().join("id_ed25519");
@@ -378,10 +452,14 @@ async fn e2e_ansible_ping_and_command_execution() {
 
     let username = get_current_username();
     let proxy_cmd = format!(
-        "\"{}\" -i --host-key \"{}\" --authorized-keys \"{}\"",
-        binary_path.display(),
-        host_key_path.display(),
-        auth_keys_path.display()
+        "{} -i --host-key {} --authorized-keys {}",
+        sh_quote_in_double_quotes(&binary_path),
+        sh_quote_in_double_quotes(&host_key_path),
+        sh_quote_in_double_quotes(&auth_keys_path)
+    );
+    let ssh_args = format!(
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand={}",
+        shlex_quote(&proxy_cmd)
     );
 
     let hosts_ini_path = tmp_dir.path().join("hosts.ini");
@@ -399,12 +477,12 @@ async fn e2e_ansible_ping_and_command_execution() {
     std::fs::write(&hosts_ini_path, hosts_content).expect("write hosts.ini");
 
     let cfg_content = format!(
-        "[defaults]\ninventory = {}\nhost_key_checking = False\nremote_tmp = {}\nlocal_tmp = {}\n[ssh_connection]\ncontrol_path_dir = {}\npipelining = True\nssh_args = -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"{}\"\n",
+        "[defaults]\ninventory = {}\nhost_key_checking = False\nremote_tmp = {}\nlocal_tmp = {}\n[ssh_connection]\ncontrol_path_dir = {}\npipelining = True\nssh_args = {}\n",
         hosts_ini_path.display(),
         tmp_ansible_dir.display(),
         tmp_ansible_dir.display(),
         cp_dir.display(),
-        proxy_cmd
+        ssh_args
     );
     std::fs::write(&ansible_cfg_path, cfg_content).expect("write ansible.cfg");
 
@@ -428,5 +506,48 @@ async fn e2e_ansible_ping_and_command_execution() {
     assert!(
         stdout_str.contains("\"ping\": \"pong\""),
         "expected ping pong in stdout: {stdout_str}"
+    );
+}
+
+#[test]
+fn test_quoting_helpers() {
+    use std::path::Path;
+
+    // Test sftp_quote_operand
+    assert_eq!(
+        sftp_quote_operand(Path::new("/tmp/normal.txt")),
+        "\"/tmp/normal.txt\""
+    );
+    assert_eq!(
+        sftp_quote_operand(Path::new("/tmp/with spaces.txt")),
+        "\"/tmp/with spaces.txt\""
+    );
+    assert_eq!(
+        sftp_quote_operand(Path::new("/tmp/with \"quotes\" and \\backslash.txt")),
+        "\"/tmp/with \\\"quotes\\\" and \\\\backslash.txt\""
+    );
+
+    // Test sh_quote_in_double_quotes
+    assert_eq!(
+        sh_quote_in_double_quotes(Path::new("/bin/vsock-sshd")),
+        "\"/bin/vsock-sshd\""
+    );
+    assert_eq!(
+        sh_quote_in_double_quotes(Path::new("/tmp/path with spaces/bin")),
+        "\"/tmp/path with spaces/bin\""
+    );
+    assert_eq!(
+        sh_quote_in_double_quotes(Path::new("/tmp/with \"quotes\" and $VAR/bin")),
+        "\"/tmp/with \\\"quotes\\\" and \\$VAR/bin\""
+    );
+
+    // Test shlex_quote
+    assert_eq!(shlex_quote(""), "''");
+    assert_eq!(shlex_quote("simple"), "'simple'");
+    assert_eq!(shlex_quote("with space"), "'with space'");
+    assert_eq!(shlex_quote("can't stop"), "'can'\\''t stop'");
+    assert_eq!(
+        shlex_quote("\"/bin/echo\" --arg \"foo bar\""),
+        "'\"/bin/echo\" --arg \"foo bar\"'"
     );
 }
