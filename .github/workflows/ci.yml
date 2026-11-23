@@ -37,6 +37,14 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Ensure Ansible is installed
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v ansible >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ansible-core
+          fi
+          ansible --version
+
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check

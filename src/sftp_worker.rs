@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -19,8 +21,50 @@ use russh_sftp::protocol::{
     StatusCode, Version,
 };
 use russh_sftp::server::Handler;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::StdioTransport;
+
+struct TrackedStream<S> {
+    inner: S,
+    drop_notify: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<S> Drop for TrackedStream<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.drop_notify.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TrackedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 const MAX_READ_LEN: usize = 256 * 1024;
 const MAX_OPEN_HANDLES: usize = 256;
@@ -77,7 +121,13 @@ pub async fn run_on_stream<S>(stream: S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    russh_sftp::server::run(stream, WorkerHandler::new()).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tracked = TrackedStream {
+        inner: stream,
+        drop_notify: Some(tx),
+    };
+    russh_sftp::server::run(tracked, WorkerHandler::new()).await;
+    let _ = rx.await;
 }
 
 impl Handler for WorkerHandler {

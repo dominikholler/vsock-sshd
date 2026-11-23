@@ -242,3 +242,191 @@ async fn e2e_openssh_client_command_execution() {
     );
     assert_eq!(stdout_str.trim(), "hello from openssh client");
 }
+
+#[tokio::test]
+async fn e2e_openssh_sftp_file_transfer() {
+    let sftp_check = std::process::Command::new("sftp").arg("-V").output();
+    if sftp_check.is_err() {
+        eprintln!("Skipping OpenSSH sftp test: 'sftp' not found in PATH");
+        return;
+    }
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+    let auth_keys_path = tmp_dir.path().join("authorized_keys");
+    let client_key_path = tmp_dir.path().join("id_ed25519");
+
+    let mut rng = rand::rng();
+    let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
+    let client_priv_openssh = client_key
+        .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+        .expect("encode private key");
+    let client_pub_openssh = client_key
+        .public_key()
+        .to_openssh()
+        .expect("encode public key");
+
+    std::fs::write(&client_key_path, client_priv_openssh.as_bytes())
+        .expect("write client private key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 client key");
+    }
+
+    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
+        .expect("write authorized_keys");
+
+    let local_file = tmp_dir.path().join("local.txt");
+    let remote_file = tmp_dir.path().join("remote.txt");
+    let downloaded_file = tmp_dir.path().join("downloaded.txt");
+    std::fs::write(&local_file, b"sftp roundtrip verification").expect("write local file");
+
+    let username = get_current_username();
+    let proxy_cmd = format!(
+        "\"{}\" -i --host-key \"{}\" --authorized-keys \"{}\"",
+        binary_path.display(),
+        host_key_path.display(),
+        auth_keys_path.display()
+    );
+
+    let batch_cmds = format!(
+        "put {} {}\nget {} {}\n",
+        local_file.display(),
+        remote_file.display(),
+        remote_file.display(),
+        downloaded_file.display()
+    );
+
+    let mut child = tokio::process::Command::new("sftp")
+        .arg("-b")
+        .arg("-")
+        .arg("-i")
+        .arg(&client_key_path)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg(format!("ProxyCommand={proxy_cmd}"))
+        .arg(format!("{username}@localhost"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sftp command");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(batch_cmds.as_bytes())
+            .await
+            .expect("write sftp batch commands");
+    }
+
+    let output = child.wait_with_output().await.expect("sftp wait");
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sftp command failed with stderr: {stderr_str}"
+    );
+
+    let downloaded_content =
+        std::fs::read_to_string(&downloaded_file).expect("read downloaded file");
+    assert_eq!(downloaded_content, "sftp roundtrip verification");
+}
+
+#[tokio::test]
+async fn e2e_ansible_ping_and_command_execution() {
+    let ansible_check = std::process::Command::new("ansible")
+        .arg("--version")
+        .output();
+    if ansible_check.is_err() {
+        eprintln!("Skipping Ansible test: 'ansible' not found in PATH");
+        return;
+    }
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+    let auth_keys_path = tmp_dir.path().join("authorized_keys");
+    let client_key_path = tmp_dir.path().join("id_ed25519");
+
+    let mut rng = rand::rng();
+    let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
+    let client_priv_openssh = client_key
+        .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+        .expect("encode private key");
+    let client_pub_openssh = client_key
+        .public_key()
+        .to_openssh()
+        .expect("encode public key");
+
+    std::fs::write(&client_key_path, client_priv_openssh.as_bytes())
+        .expect("write client private key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 client key");
+    }
+
+    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
+        .expect("write authorized_keys");
+
+    let username = get_current_username();
+    let proxy_cmd = format!(
+        "\"{}\" -i --host-key \"{}\" --authorized-keys \"{}\"",
+        binary_path.display(),
+        host_key_path.display(),
+        auth_keys_path.display()
+    );
+
+    let hosts_ini_path = tmp_dir.path().join("hosts.ini");
+    let ansible_cfg_path = tmp_dir.path().join("ansible.cfg");
+    let cp_dir = tmp_dir.path().join("cp");
+    let tmp_ansible_dir = tmp_dir.path().join("tmp");
+    std::fs::create_dir_all(&cp_dir).expect("create cp dir");
+    std::fs::create_dir_all(&tmp_ansible_dir).expect("create tmp dir");
+
+    let hosts_content = format!(
+        "[all]\ntestnode ansible_connection=ssh ansible_user={} ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file={} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\\\"{}\\\"\"\n",
+        username,
+        client_key_path.display(),
+        proxy_cmd
+    );
+    std::fs::write(&hosts_ini_path, hosts_content).expect("write hosts.ini");
+
+    let cfg_content = format!(
+        "[defaults]\ninventory = {}\nhost_key_checking = False\nremote_tmp = {}\nlocal_tmp = {}\n[ssh_connection]\ncontrol_path_dir = {}\npipelining = True\n",
+        hosts_ini_path.display(),
+        tmp_ansible_dir.display(),
+        tmp_ansible_dir.display(),
+        cp_dir.display()
+    );
+    std::fs::write(&ansible_cfg_path, cfg_content).expect("write ansible.cfg");
+
+    let output = tokio::process::Command::new("ansible")
+        .env("ANSIBLE_CONFIG", &ansible_cfg_path)
+        .env("ANSIBLE_HOME", &tmp_ansible_dir)
+        .env("ANSIBLE_LOCAL_TEMP", &tmp_ansible_dir)
+        .arg("all")
+        .arg("-m")
+        .arg("ping")
+        .output()
+        .await
+        .expect("run ansible ping");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ansible ping failed: stdout={stdout_str}, stderr={stderr_str}"
+    );
+    assert!(
+        stdout_str.contains("\"ping\": \"pong\""),
+        "expected ping pong in stdout: {stdout_str}"
+    );
+}
