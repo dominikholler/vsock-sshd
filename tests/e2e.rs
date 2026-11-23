@@ -293,7 +293,7 @@ async fn e2e_openssh_sftp_file_transfer() {
     );
 
     let batch_cmds = format!(
-        "put {} {}\nget {} {}\n",
+        "put \"{}\" \"{}\"\nget \"{}\" \"{}\"\n",
         local_file.display(),
         remote_file.display(),
         remote_file.display(),
@@ -392,19 +392,19 @@ async fn e2e_ansible_ping_and_command_execution() {
     std::fs::create_dir_all(&tmp_ansible_dir).expect("create tmp dir");
 
     let hosts_content = format!(
-        "[all]\ntestnode ansible_connection=ssh ansible_user={} ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file={} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\\\"{}\\\"\"\n",
+        "[all]\ntestnode ansible_connection=ssh ansible_user=\"{}\" ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file=\"{}\"\n",
         username,
-        client_key_path.display(),
-        proxy_cmd
+        client_key_path.display()
     );
     std::fs::write(&hosts_ini_path, hosts_content).expect("write hosts.ini");
 
     let cfg_content = format!(
-        "[defaults]\ninventory = {}\nhost_key_checking = False\nremote_tmp = {}\nlocal_tmp = {}\n[ssh_connection]\ncontrol_path_dir = {}\npipelining = True\n",
+        "[defaults]\ninventory = {}\nhost_key_checking = False\nremote_tmp = {}\nlocal_tmp = {}\n[ssh_connection]\ncontrol_path_dir = {}\npipelining = True\nssh_args = -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"{}\"\n",
         hosts_ini_path.display(),
         tmp_ansible_dir.display(),
         tmp_ansible_dir.display(),
-        cp_dir.display()
+        cp_dir.display(),
+        proxy_cmd
     );
     std::fs::write(&ansible_cfg_path, cfg_content).expect("write ansible.cfg");
 
