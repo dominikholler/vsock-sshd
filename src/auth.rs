@@ -64,9 +64,13 @@ pub fn authorize_public_key_with_path(
     None
 }
 
-/// Parse a single OpenSSH `authorized_keys` line, skipping blank lines,
-/// comments, and optional leading key options (e.g. `restrict,from="..."`).
-fn parse_authorized_key_line(line: &str) -> Option<PublicKey> {
+/// Parse a single OpenSSH `authorized_keys` line, skipping blank lines and comments.
+///
+/// Enforces fail-closed security (F-01): any entry containing options (such as
+/// `command=`, `from=`, `environment=`, `expiry-time=`, or `restrict`) is strictly
+/// rejected because vsock-sshd does not enforce key options. Discarding options
+/// would risk bypassing administrator restrictions.
+pub fn parse_authorized_key_line(line: &str) -> Option<PublicKey> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -77,26 +81,34 @@ fn parse_authorized_key_line(line: &str) -> Option<PublicKey> {
         return Some(key);
     }
 
-    // Handle leading comma-separated options, respecting quoted values.
-    let key_slice = strip_leading_options(trimmed)?;
-    PublicKey::from_openssh(key_slice).ok()
+    // If the line has leading options followed by a key, reject fail-closed
+    // so no administrator restriction is ever silently bypassed.
+    if let Some(key_slice) = find_key_after_options(trimmed) {
+        if PublicKey::from_openssh(key_slice).is_ok() {
+            warn!("authorized_keys options are unsupported (rejecting fail-closed)");
+        }
+    }
+
+    None
 }
 
-fn strip_leading_options(line: &str) -> Option<&str> {
+fn find_key_after_options(line: &str) -> Option<&str> {
     let mut in_quotes = false;
-    let mut escaped = false;
+    let mut chars = line.char_indices().peekable();
 
-    for (idx, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '\\' if in_quotes => escaped = true,
+            '\\' if in_quotes => {
+                if let Some(&(_, '"')) = chars.peek() {
+                    chars.next();
+                }
+            }
             '"' => in_quotes = !in_quotes,
             ' ' | '\t' if !in_quotes => {
-                let rest = line[idx..].trim_start();
-                return (!rest.is_empty()).then_some(rest);
+                let rest = line[idx..].trim_start_matches([' ', '\t']);
+                if !rest.is_empty() {
+                    return Some(rest);
+                }
             }
             _ => {}
         }
@@ -131,15 +143,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_key_with_quoted_options_and_spaces() {
+    fn rejects_keys_with_options_fail_closed() {
         let key = gen_key();
         let pub_str = key.to_openssh().unwrap();
-        let line = format!(
-            r#"restrict,from="10.0.0.1, 10.0.0.2",environment="MSG=\"hello world\"" {pub_str} ops@vm"#
-        );
 
-        let parsed = parse_authorized_key_line(&line).expect("key with options");
-        assert_eq!(parsed.key_data(), key.key_data());
+        // Options must all be rejected fail-closed (F-01)
+        let command_line = format!(r#"command="echo 1" {pub_str} user@host"#);
+        assert!(parse_authorized_key_line(&command_line).is_none());
+
+        let from_line = format!(r#"from="10.0.0.1" {pub_str} user@host"#);
+        assert!(parse_authorized_key_line(&from_line).is_none());
+
+        let env_line = format!(r#"environment="FOO=bar" {pub_str} user@host"#);
+        assert!(parse_authorized_key_line(&env_line).is_none());
+
+        let expiry_line = format!(r#"expiry-time="20261124" {pub_str} user@host"#);
+        assert!(parse_authorized_key_line(&expiry_line).is_none());
+
+        let restrict_line = format!(r#"restrict {pub_str} user@host"#);
+        assert!(parse_authorized_key_line(&restrict_line).is_none());
+
+        let multi_opts = format!(r#"restrict,command="dump",from="127.0.0.1" {pub_str} user"#);
+        assert!(parse_authorized_key_line(&multi_opts).is_none());
     }
 
     #[test]

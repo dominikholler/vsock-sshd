@@ -551,3 +551,101 @@ fn test_quoting_helpers() {
         "'\"/bin/echo\" --arg \"foo bar\"'"
     );
 }
+
+async fn start_server_and_connect(
+    auth_keys_line: &str,
+    client_key: &PrivateKey,
+) -> (
+    tokio::process::Child,
+    client::Handle<TestClientHandler>,
+    russh::client::AuthResult,
+    tempfile::TempDir,
+) {
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+    let auth_keys_path = tmp_dir.path().join("authorized_keys");
+
+    std::fs::write(&auth_keys_path, format!("{auth_keys_line}\n")).expect("write authorized_keys");
+
+    let username = get_current_username();
+
+    let mut child = tokio::process::Command::new(&binary_path)
+        .arg("-i")
+        .arg("--host-key")
+        .arg(&host_key_path)
+        .arg("--authorized-keys")
+        .arg(&auth_keys_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn vsock-sshd");
+
+    let child_stdin = child.stdin.take().expect("child stdin");
+    let child_stdout = child.stdout.take().expect("child stdout");
+
+    let stream = ChildStream {
+        reader: child_stdout,
+        writer: child_stdin,
+    };
+
+    let client_cfg = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    });
+
+    let mut session = client::connect_stream(client_cfg, stream, TestClientHandler)
+        .await
+        .expect("client handshake");
+
+    let auth_res = session
+        .authenticate_publickey(
+            &username,
+            PrivateKeyWithHashAlg::new(Arc::new(client_key.clone()), None),
+        )
+        .await
+        .expect("auth exchange");
+
+    (child, session, auth_res, tmp_dir)
+}
+
+#[tokio::test]
+async fn e2e_authorized_keys_options_rejected_fail_closed() {
+    let mut rng = rand::rng();
+    let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("keygen");
+    let client_pub = client_key.public_key().to_openssh().expect("to_openssh");
+
+    // Positive baseline: confirm that the same key without options authenticates successfully
+    let (mut bare_child, bare_session, bare_auth_res, _bare_tmp) =
+        start_server_and_connect(&client_pub, &client_key).await;
+    assert!(
+        bare_auth_res.success(),
+        "expected bare key without options to authenticate successfully"
+    );
+    drop(bare_session);
+    let _ = bare_child.wait().await;
+
+    // All authorized_keys options must be rejected fail-closed (F-01)
+    let option_lines = [
+        format!("command=\"echo 1\" {client_pub}"),
+        format!("from=\"127.0.0.1\" {client_pub}"),
+        format!("environment=\"VAR=val\" {client_pub}"),
+        format!("expiry-time=\"20200101\" {client_pub}"),
+        format!("restrict {client_pub}"),
+        format!("no-pty {client_pub}"),
+        format!("custom-option=\"val\" {client_pub}"),
+        format!("restrict,command=\"echo 1\" {client_pub}"),
+    ];
+
+    for line in &option_lines {
+        let (mut child, session, auth_res, _tmp) =
+            start_server_and_connect(line, &client_key).await;
+        assert!(
+            !auth_res.success(),
+            "expected key with options to fail authentication fail-closed: {line}"
+        );
+        drop(session);
+        let _ = child.wait().await;
+    }
+}
