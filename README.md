@@ -66,3 +66,15 @@ Run your vsock transport proxy as `NT AUTHORITY\SYSTEM` (required for `LsaLogonU
 Authorized keys follow OpenSSH-Win32 strict paths:
 - Administrators: `%ProgramData%\ssh\administrators_authorized_keys` (owned by `SYSTEM` or `Administrators`)
 - Standard users: `<ProfileDir>\.ssh\authorized_keys` (owned by the user, `SYSTEM`, or `Administrators`)
+
+## Authorized Keys Configuration
+
+By default, authorized keys follow standard OpenSSH locations:
+- **Linux**: `<home>/.ssh/authorized_keys` (owned by the user or root, permissions not group/world-writable, parent directory not group/world-writable).
+- **Windows**:
+  - Administrators: `%ProgramData%\ssh\administrators_authorized_keys` (owned by `SYSTEM` or `Administrators`, DACL grants no write rights to untrusted principals).
+  - Standard users: `<ProfileDir>\.ssh\authorized_keys` (owned by the user, `SYSTEM`, or `Administrators`, DACL grants no write rights to untrusted principals).
+
+A custom location can be specified explicitly via `--authorized-keys <PATH>`:
+- **Directory Mode**: If `<PATH>` is a directory, keys are looked up per-user at `<PATH>/<username>` with strict ownership and permission validation. This is the recommended mode for multi-user systems. On Linux and Windows, path components are traversed without following symlinks or reparse points and keys are opened relative to the verified directory handle; the target directory and user files must have trusted ownership and no write permissions for untrusted principals.
+- **File Mode**: If `<PATH>` is a specific file, its parent directory and the file itself are traversed without following symlinks or reparse points and strictly validated (regular file, <= 1 MiB, no group/world-writable permissions on Unix, no untrusted DACL write rights on Windows). To enforce strict user isolation, a standalone file must be owned by the authenticating user (on Linux: `user.uid`; on Windows: the user's SID for standard users, or `SYSTEM`/`Administrators` for admin users). An unprivileged user cannot authenticate using a file owned by root or another user.

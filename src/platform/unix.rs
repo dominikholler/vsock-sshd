@@ -1,7 +1,8 @@
 use std::ffi::{CStr, CString};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -106,37 +107,177 @@ pub fn lookup_user(username: &str) -> Result<Option<OsUser>> {
     }))
 }
 
-/// Open and validate `<home>/.ssh/authorized_keys` enforcing OpenSSH StrictModes:
-/// - `home`, `.ssh`, and `authorized_keys` must be owned by `user.uid` or root (`0`).
-/// - None may be group- or world-writable (`mode & 0o022 == 0`).
-/// - `authorized_keys` is opened with `O_NOFOLLOW | O_CLOEXEC` and verified via `fstat`.
-pub fn read_authorized_keys_strict(user: &OsUser) -> Result<Option<String>> {
-    verify_dir_strict(&user.home, user.uid)?;
-
-    let ssh_dir = user.home.join(".ssh");
-    if !ssh_dir.exists() {
-        return Ok(None);
-    }
-    verify_dir_strict(&ssh_dir, user.uid)?;
-
-    let key_path = ssh_dir.join("authorized_keys");
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&key_path)
+fn open_dir_no_symlinks(path: &Path) -> Result<File> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        Ok(f) => f,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+        bail!("parent directory traversal ('..') is not permitted in authorized_keys paths");
+    }
+
+    let mut components = path.components().peekable();
+    let mut current_file = match components.peek() {
+        Some(std::path::Component::RootDir) => {
+            components.next();
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open("/")
+                .context("failed to open root directory")?
+        }
+        _ => OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(".")
+            .context("failed to open current working directory")?,
     };
+
+    for comp in components {
+        match comp {
+            std::path::Component::Normal(name) => {
+                let c_name =
+                    CString::new(name.as_bytes()).context("invalid directory component in path")?;
+                let next_fd = unsafe {
+                    libc::openat(
+                        current_file.as_raw_fd(),
+                        c_name.as_ptr(),
+                        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if next_fd < 0 {
+                    return Err(io::Error::last_os_error()).with_context(|| {
+                        format!(
+                            "failed to open directory component '{}'",
+                            name.to_string_lossy()
+                        )
+                    });
+                }
+                current_file = unsafe { File::from_raw_fd(next_fd) };
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                bail!(
+                    "parent directory traversal ('..') is not permitted in authorized_keys paths"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(current_file)
+}
+
+fn verify_dir_strict(path: &Path, expected_uid: u32) -> Result<File> {
+    let dir = open_dir_no_symlinks(path)?;
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if st.st_uid != expected_uid && st.st_uid != 0 {
+        bail!(
+            "directory {} has untrusted owner uid {} (expected 0 or {})",
+            path.display(),
+            st.st_uid,
+            expected_uid
+        );
+    }
+    if (st.st_mode & 0o022) != 0 {
+        bail!(
+            "directory {} is group- or world-writable ({:o})",
+            path.display(),
+            st.st_mode & 0o777
+        );
+    }
+    Ok(dir)
+}
+
+/// Open and validate authorized_keys enforcing OpenSSH StrictModes:
+/// - Directory and authorized_keys file must be owned by `user.uid` or root (`0`).
+/// - Standalone custom files must be owned by `user.uid` (or root for root) to preserve user isolation.
+/// - None may be group- or world-writable (`mode & 0o022 == 0`).
+/// - `authorized_keys` is opened with `O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC` to prevent symlink traversal and FIFO hangs.
+/// - File must be a regular file, size capped at 1 MiB.
+pub fn read_authorized_keys_strict(
+    user: &OsUser,
+    custom_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let (dir_file, file_name, is_custom_file) = match custom_path {
+        Some(p) => {
+            let is_dir = match std::fs::symlink_metadata(p) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    bail!("authorized_keys path {} is a symlink", p.display());
+                }
+                Ok(m) => m.is_dir(),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => return Err(err.into()),
+            };
+            if is_dir {
+                let dir_file = verify_dir_strict(p, user.uid)?;
+                let name = CString::new(user.username.as_bytes())
+                    .context("invalid username for authorized_keys lookup")?;
+                (dir_file, name, false)
+            } else {
+                let parent = p.parent().unwrap_or_else(|| Path::new("."));
+                let parent_dir = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let parent_file = verify_dir_strict(parent_dir, user.uid)?;
+                let file_name = p
+                    .file_name()
+                    .context("invalid custom authorized_keys file path")?;
+                let name = CString::new(file_name.as_bytes())
+                    .context("invalid custom authorized_keys file name")?;
+                (parent_file, name, true)
+            }
+        }
+        None => {
+            let _ = verify_dir_strict(&user.home, user.uid)?;
+            let ssh_dir = user.home.join(".ssh");
+            if !ssh_dir.exists() {
+                return Ok(None);
+            }
+            let ssh_dir_file = verify_dir_strict(&ssh_dir, user.uid)?;
+            let name = CString::new("authorized_keys").unwrap();
+            (ssh_dir_file, name, false)
+        }
+    };
+
+    let fd = unsafe {
+        libc::openat(
+            dir_file.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err.into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
 
     let meta = file.metadata()?;
     if !meta.is_file() {
         bail!("authorized_keys is not a regular file");
     }
-    if meta.uid() != user.uid && meta.uid() != 0 {
+
+    let trusted_owner = if is_custom_file {
+        if user.uid == 0 {
+            meta.uid() == 0
+        } else {
+            meta.uid() == user.uid
+        }
+    } else {
+        meta.uid() == user.uid || meta.uid() == 0
+    };
+    if !trusted_owner {
         bail!("authorized_keys has untrusted owner uid {}", meta.uid());
     }
+
     if (meta.mode() & 0o022) != 0 {
         bail!(
             "authorized_keys has unsafe permissions {:o}",
@@ -148,33 +289,12 @@ pub fn read_authorized_keys_strict(user: &OsUser) -> Result<Option<String>> {
     }
 
     let mut contents = String::new();
-    let mut reader = file;
+    let mut reader = file.take(MAX_AUTHORIZED_KEYS_BYTES + 1);
     reader.read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_AUTHORIZED_KEYS_BYTES {
+        bail!("authorized_keys exceeds 1 MiB limit");
+    }
     Ok(Some(contents))
-}
-
-fn verify_dir_strict(path: &Path, expected_uid: u32) -> Result<()> {
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    if st.st_uid != expected_uid && st.st_uid != 0 {
-        bail!("{} has untrusted owner uid {}", path.display(), st.st_uid);
-    }
-    if (st.st_mode & 0o022) != 0 {
-        bail!(
-            "{} is group- or world-writable ({:o})",
-            path.display(),
-            st.st_mode & 0o777
-        );
-    }
-    Ok(())
 }
 
 pub fn spawn_exec(user: &OsUser, command: &str) -> Result<SpawnedChild> {
@@ -319,7 +439,7 @@ mod tests {
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let user = current_test_user(home.clone());
-        assert_eq!(read_authorized_keys_strict(&user).unwrap(), None);
+        assert_eq!(read_authorized_keys_strict(&user, None).unwrap(), None);
 
         let ssh_dir = home.join(".ssh");
         std::fs::create_dir(&ssh_dir).unwrap();
@@ -330,17 +450,17 @@ mod tests {
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Valid 0700/0700/0600 passes
-        let content = read_authorized_keys_strict(&user).unwrap().unwrap();
+        let content = read_authorized_keys_strict(&user, None).unwrap().unwrap();
         assert!(content.contains("ssh-ed25519"));
 
         // Group-writable authorized_keys must be rejected
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o620)).unwrap();
-        assert!(read_authorized_keys_strict(&user).is_err());
+        assert!(read_authorized_keys_strict(&user, None).is_err());
 
         // Restore key_file, make .ssh group-writable -> must be rejected
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(read_authorized_keys_strict(&user).is_err());
+        assert!(read_authorized_keys_strict(&user, None).is_err());
 
         // Symlinked authorized_keys must be rejected via O_NOFOLLOW
         std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -348,7 +468,133 @@ mod tests {
         std::fs::write(&target, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA symlink\n").unwrap();
         std::fs::remove_file(&key_file).unwrap();
         symlink(&target, &key_file).unwrap();
-        assert!(read_authorized_keys_strict(&user).is_err());
+        assert!(read_authorized_keys_strict(&user, None).is_err());
+    }
+
+    #[test]
+    fn strict_custom_authorized_keys_validation_and_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let user = current_test_user(dir.clone());
+        let custom_file = dir.join("custom_keys");
+
+        // 1. Valid custom file passes
+        std::fs::write(
+            &custom_file,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA custom\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&custom_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let content = read_authorized_keys_strict(&user, Some(&custom_file))
+            .unwrap()
+            .unwrap();
+        assert!(content.contains("custom"));
+
+        // 2. Group/world-writable custom file rejected
+        std::fs::set_permissions(&custom_file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(read_authorized_keys_strict(&user, Some(&custom_file)).is_err());
+        std::fs::set_permissions(&custom_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // 3. Group/world-writable parent dir rejected
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(read_authorized_keys_strict(&user, Some(&custom_file)).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // 4. Symlink custom file rejected
+        let sym_file = dir.join("sym_keys");
+        symlink(&custom_file, &sym_file).unwrap();
+        assert!(read_authorized_keys_strict(&user, Some(&sym_file)).is_err());
+
+        // 5. User isolation: other user cannot use this custom file
+        let other_user = OsUser {
+            username: "otheruser".into(),
+            uid: user.uid + 1,
+            gid: user.gid + 1,
+            home: dir.clone(),
+            shell: PathBuf::from("/bin/sh"),
+        };
+        assert!(read_authorized_keys_strict(&other_user, Some(&custom_file)).is_err());
+
+        // 6. Directory mode: looks up <dir>/<username>
+        let per_user_file = dir.join(&user.username);
+        std::fs::write(
+            &per_user_file,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA per_user\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&per_user_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let per_user_content = read_authorized_keys_strict(&user, Some(&dir))
+            .unwrap()
+            .unwrap();
+        assert!(per_user_content.contains("per_user"));
+
+        // 7. Oversized file (> 1 MiB) rejected
+        let large_file = dir.join("large_keys");
+        let large_data = vec![b'A'; (MAX_AUTHORIZED_KEYS_BYTES + 10) as usize];
+        std::fs::write(&large_file, large_data).unwrap();
+        std::fs::set_permissions(&large_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_authorized_keys_strict(&user, Some(&large_file)).is_err());
+
+        // 8. Symlinked custom directory rejected
+        let sym_dir = tmp.path().join("sym_dir");
+        symlink(&dir, &sym_dir).unwrap();
+        assert!(read_authorized_keys_strict(&user, Some(&sym_dir)).is_err());
+
+        // 9. Intermediate symlink component rejected in both directory and file modes
+        let nested_dir = dir.join("nested");
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let nested_user_file = nested_dir.join(&user.username);
+        std::fs::write(
+            &nested_user_file,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA nested\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nested_user_file, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let sym_nested_dir = sym_dir.join("nested");
+        assert!(read_authorized_keys_strict(&user, Some(&sym_nested_dir)).is_err());
+        assert!(
+            read_authorized_keys_strict(&user, Some(&sym_nested_dir.join(&user.username))).is_err()
+        );
+
+        // 10. Parent directory traversal ('..') rejected
+        assert!(read_authorized_keys_strict(
+            &user,
+            Some(&nested_dir.join("..").join("custom_keys"))
+        )
+        .is_err());
+
+        // 11. Pinned directory descriptor prevents TOCTOU directory replacement:
+        // replacing the path after verify_dir_strict still resolves inside the original inode.
+        let pinned_dir = verify_dir_strict(&nested_dir, user.uid).unwrap();
+        let moved_dir = dir.join("nested_moved");
+        std::fs::rename(&nested_dir, &moved_dir).unwrap();
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let replaced_file = nested_dir.join(&user.username);
+        std::fs::write(
+            &replaced_file,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA attacker\n",
+        )
+        .unwrap();
+        let c_name = CString::new(user.username.as_bytes()).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                pinned_dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        let mut pinned_content = String::new();
+        unsafe { File::from_raw_fd(fd) }
+            .read_to_string(&mut pinned_content)
+            .unwrap();
+        assert!(pinned_content.contains("nested"));
+        assert!(!pinned_content.contains("attacker"));
     }
 
     #[test]

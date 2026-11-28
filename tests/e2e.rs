@@ -67,6 +67,23 @@ fn get_current_username() -> String {
         .unwrap_or_else(|_| "user".to_string())
 }
 
+fn write_strict_auth_keys(path: &std::path::Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    std::fs::write(path, content).expect("write authorized_keys");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("set permissions 0600 on authorized_keys");
+    }
+}
+
 #[tokio::test]
 async fn e2e_binary_ssh_command_execution() {
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
@@ -83,8 +100,7 @@ async fn e2e_binary_ssh_command_execution() {
     let client_pub_openssh = client_pub.to_openssh().expect("encode public key");
 
     // 2. Write client public key to temporary authorized_keys file
-    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
-        .expect("write authorized_keys");
+    write_strict_auth_keys(&auth_keys_path, &format!("{client_pub_openssh}\n"));
 
     let username = get_current_username();
 
@@ -207,8 +223,7 @@ async fn e2e_openssh_client_command_execution() {
             .expect("chmod 0600 client key");
     }
 
-    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
-        .expect("write authorized_keys");
+    write_strict_auth_keys(&auth_keys_path, &format!("{client_pub_openssh}\n"));
 
     let username = get_current_username();
     let proxy_cmd = format!(
@@ -335,8 +350,7 @@ async fn e2e_openssh_sftp_file_transfer() {
             .expect("chmod 0600 client key");
     }
 
-    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
-        .expect("write authorized_keys");
+    write_strict_auth_keys(&auth_keys_path, &format!("{client_pub_openssh}\n"));
 
     let local_file = tmp_dir.path().join(if cfg!(windows) {
         "local file with spaces.txt"
@@ -447,8 +461,7 @@ async fn e2e_ansible_ping_and_command_execution() {
             .expect("chmod 0600 client key");
     }
 
-    std::fs::write(&auth_keys_path, format!("{client_pub_openssh}\n"))
-        .expect("write authorized_keys");
+    write_strict_auth_keys(&auth_keys_path, &format!("{client_pub_openssh}\n"));
 
     let username = get_current_username();
     let proxy_cmd = format!(
@@ -566,7 +579,7 @@ async fn start_server_and_connect(
     let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
     let auth_keys_path = tmp_dir.path().join("authorized_keys");
 
-    std::fs::write(&auth_keys_path, format!("{auth_keys_line}\n")).expect("write authorized_keys");
+    write_strict_auth_keys(&auth_keys_path, &format!("{auth_keys_line}\n"));
 
     let username = get_current_username();
 
@@ -648,4 +661,174 @@ async fn e2e_authorized_keys_options_rejected_fail_closed() {
         drop(session);
         let _ = child.wait().await;
     }
+}
+
+#[tokio::test]
+async fn e2e_custom_authorized_keys_rejects_unsafe_permissions() {
+    let mut rng = rand::rng();
+    let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
+    let client_pub = client_key.public_key().to_openssh().expect("to_openssh");
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+    let auth_keys_path = tmp_dir.path().join("authorized_keys");
+
+    write_strict_auth_keys(&auth_keys_path, &format!("{client_pub}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_keys_path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    }
+
+    let username = get_current_username();
+    let mut child = tokio::process::Command::new(&binary_path)
+        .arg("-i")
+        .arg("--host-key")
+        .arg(&host_key_path)
+        .arg("--authorized-keys")
+        .arg(&auth_keys_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn vsock-sshd");
+
+    let child_stdin = child.stdin.take().expect("child stdin");
+    let child_stdout = child.stdout.take().expect("child stdout");
+    let stream = ChildStream {
+        reader: child_stdout,
+        writer: child_stdin,
+    };
+    let client_cfg = Arc::new(client::Config::default());
+    let mut session = client::connect_stream(client_cfg, stream, TestClientHandler)
+        .await
+        .expect("client handshake");
+    let auth_res = session
+        .authenticate_publickey(
+            &username,
+            PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+        )
+        .await
+        .expect("auth exchange");
+
+    #[cfg(unix)]
+    assert!(
+        !auth_res.success(),
+        "group-writable custom authorized_keys must fail"
+    );
+
+    drop(session);
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn e2e_custom_authorized_keys_rejects_symlink() {
+    #[cfg(unix)]
+    {
+        let mut rng = rand::rng();
+        let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
+        let client_pub = client_key.public_key().to_openssh().expect("to_openssh");
+
+        let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+        let tmp_dir = tempfile::tempdir().expect("create tempdir");
+        let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+        let real_keys_path = tmp_dir.path().join("real_keys");
+        let sym_keys_path = tmp_dir.path().join("sym_keys");
+
+        write_strict_auth_keys(&real_keys_path, &format!("{client_pub}\n"));
+        std::os::unix::fs::symlink(&real_keys_path, &sym_keys_path).unwrap();
+
+        let username = get_current_username();
+        let mut child = tokio::process::Command::new(&binary_path)
+            .arg("-i")
+            .arg("--host-key")
+            .arg(&host_key_path)
+            .arg("--authorized-keys")
+            .arg(&sym_keys_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn vsock-sshd");
+
+        let child_stdin = child.stdin.take().expect("child stdin");
+        let child_stdout = child.stdout.take().expect("child stdout");
+        let stream = ChildStream {
+            reader: child_stdout,
+            writer: child_stdin,
+        };
+        let client_cfg = Arc::new(client::Config::default());
+        let mut session = client::connect_stream(client_cfg, stream, TestClientHandler)
+            .await
+            .expect("client handshake");
+        let auth_res = session
+            .authenticate_publickey(
+                &username,
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
+            .await
+            .expect("auth exchange");
+
+        assert!(
+            !auth_res.success(),
+            "symlinked custom authorized_keys must fail"
+        );
+
+        drop(session);
+        let _ = child.wait().await;
+    }
+}
+
+#[tokio::test]
+async fn e2e_custom_authorized_keys_directory_mode() {
+    let mut rng = rand::rng();
+    let client_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("client keygen");
+    let client_pub = client_key.public_key().to_openssh().expect("to_openssh");
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_vsock-sshd"));
+    let tmp_dir = tempfile::tempdir().expect("create tempdir");
+    let host_key_path = tmp_dir.path().join("ssh_host_ed25519_key");
+    let username = get_current_username();
+    let user_keys_path = tmp_dir.path().join(&username);
+
+    write_strict_auth_keys(&user_keys_path, &format!("{client_pub}\n"));
+
+    let mut child = tokio::process::Command::new(&binary_path)
+        .arg("-i")
+        .arg("--host-key")
+        .arg(&host_key_path)
+        .arg("--authorized-keys")
+        .arg(tmp_dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn vsock-sshd");
+
+    let child_stdin = child.stdin.take().expect("child stdin");
+    let child_stdout = child.stdout.take().expect("child stdout");
+    let stream = ChildStream {
+        reader: child_stdout,
+        writer: child_stdin,
+    };
+    let client_cfg = Arc::new(client::Config::default());
+    let mut session = client::connect_stream(client_cfg, stream, TestClientHandler)
+        .await
+        .expect("client handshake");
+    let auth_res = session
+        .authenticate_publickey(
+            &username,
+            PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+        )
+        .await
+        .expect("auth exchange");
+
+    assert!(
+        auth_res.success(),
+        "directory-mode custom authorized_keys should succeed for matching user"
+    );
+
+    drop(session);
+    let _ = child.wait().await;
 }
