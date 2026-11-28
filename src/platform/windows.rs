@@ -1,17 +1,23 @@
 use std::ffi::{c_void, OsStr, OsString};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use anyhow::{bail, Context, Result};
 use windows_sys::core::BOOL;
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    NtOpenFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT,
+};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, SetHandleInformation, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LUID, NTSTATUS, TRUE,
+    CloseHandle, GetLastError, LocalFree, RtlNtStatusToDosError, SetHandleInformation, FALSE,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, NTSTATUS, OBJ_CASE_INSENSITIVE,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, TRUE, UNICODE_STRING,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetApiBufferFree, NetUserGetLocalGroups, LG_INCLUDE_INDIRECT, LOCALGROUP_USERS_INFO_0,
@@ -26,11 +32,16 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, EqualSid, IsWellKnownSid, LookupAccountNameW, SecurityImpersonation,
-    TokenPrimary, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSID,
-    QUOTA_LIMITS, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_ALL_ACCESS, TOKEN_SOURCE,
+    DuplicateTokenEx, EqualSid, GetAce, IsWellKnownSid, LookupAccountNameW, SecurityImpersonation,
+    TokenPrimary, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER,
+    ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, QUOTA_LIMITS,
+    SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_ALL_ACCESS, TOKEN_SOURCE,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    READ_CONTROL, SYNCHRONIZE,
+};
 use windows_sys::Win32::System::Environment::{
     CreateEnvironmentBlock, DestroyEnvironmentBlock, ExpandEnvironmentStringsW,
 };
@@ -42,10 +53,12 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use super::{current_exe_path, SpawnedChild};
 
 const MAX_AUTHORIZED_KEYS_BYTES: u64 = 1024 * 1024;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 #[derive(Clone, Debug)]
 pub struct OsUser {
@@ -138,58 +151,251 @@ pub fn lookup_user(username: &str) -> Result<Option<OsUser>> {
     }))
 }
 
-/// OpenSSH-Win32 strict `authorized_keys` resolution:
-/// - Administrators use `%ProgramData%\ssh\administrators_authorized_keys`
-/// - Standard users use `<ProfileDir>\.ssh\authorized_keys`
-///
-/// Refuses reparse points (symlinks/junctions) and verifies file owner SID.
-pub fn read_authorized_keys_strict(user: &OsUser) -> Result<Option<String>> {
-    let key_path = if user.is_admin {
-        let base = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join("ssh").join("administrators_authorized_keys")
-    } else {
-        user.home.join(".ssh").join("authorized_keys")
+fn open_child_no_reparse(dir: &File, name: &OsStr, is_dir: bool) -> Result<Option<File>> {
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    if wide.is_empty()
+        || wide.contains(&0)
+        || wide.contains(&(b'\\' as u16))
+        || wide.contains(&(b'/' as u16))
+    {
+        bail!("invalid path component '{}'", name.to_string_lossy());
+    }
+    let byte_len =
+        u16::try_from(wide.len() * 2).context("path component exceeds UNICODE_STRING limit")?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: wide.as_mut_ptr(),
     };
+    let obj_attr = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: dir.as_raw_handle() as HANDLE,
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let desired_access = if is_dir {
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+    } else {
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+    };
+    let open_options = FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | if is_dir {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
 
-    let file = match OpenOptions::new()
+    let mut handle: HANDLE = null_mut();
+    let mut iosb = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            desired_access,
+            &obj_attr,
+            &mut iosb,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            open_options,
+        )
+    };
+    if status < 0 {
+        if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        let win32 = unsafe { RtlNtStatusToDosError(status) };
+        let err = io::Error::from_raw_os_error(win32 as i32);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to open '{}' without following reparse points",
+                name.to_string_lossy()
+            )
+        });
+    }
+
+    let file = unsafe { File::from_raw_handle(handle as _) };
+    let meta = file.metadata()?;
+    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        bail!(
+            "path component '{}' is a reparse point (refused)",
+            name.to_string_lossy()
+        );
+    }
+    Ok(Some(file))
+}
+
+fn open_dir_no_reparse(path: &Path) -> Result<Option<File>> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!("parent directory traversal ('..') is not permitted in authorized_keys paths");
+    }
+
+    let mut components = path.components().peekable();
+    let mut root_path = PathBuf::new();
+    while let Some(comp) = components.peek() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                root_path.push(comp.as_os_str());
+                components.next();
+            }
+            _ => break,
+        }
+    }
+
+    if !root_path.as_os_str().is_empty() && !path.has_root() {
+        bail!(
+            "drive-relative paths without a root directory are not permitted: {}",
+            path.display()
+        );
+    }
+
+    let start_path = if root_path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root_path.as_path()
+    };
+    let mut current_dir = match OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&key_path)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(start_path)
     {
         Ok(f) => f,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
+    if root_path.as_os_str().is_empty()
+        && (current_dir.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        bail!(
+            "directory {} is a reparse point (refused)",
+            start_path.display()
+        );
+    }
+
+    for comp in components {
+        match comp {
+            Component::Normal(name) => {
+                let Some(next) = open_child_no_reparse(&current_dir, name, true)? else {
+                    return Ok(None);
+                };
+                current_dir = next;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {}
+        }
+    }
+    Ok(Some(current_dir))
+}
+
+/// OpenSSH-Win32 strict `authorized_keys` resolution:
+/// - Default: Administrators use `%ProgramData%\ssh\administrators_authorized_keys`
+///   Standard users use `<ProfileDir>\.ssh\authorized_keys`
+/// - Custom: If directory, `<dir>\<username>`. If file, must be owned by authenticating user (or admin).
+///
+/// Walks directories without following reparse points (symlinks/junctions), opens files relative
+/// to the verified directory handle via `NtOpenFile`, and verifies owner SID and DACL write restrictions.
+pub fn read_authorized_keys_strict(
+    user: &OsUser,
+    custom_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let (dir_file, file_name, is_custom_file) = match custom_path {
+        Some(p) => {
+            let is_dir = match std::fs::symlink_metadata(p) {
+                Ok(m) if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 => {
+                    bail!(
+                        "custom authorized_keys path {} is a reparse point",
+                        p.display()
+                    );
+                }
+                Ok(m) => m.is_dir(),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(err) => return Err(err.into()),
+            };
+            if is_dir {
+                let dir_file = open_dir_no_reparse(p)?
+                    .with_context(|| format!("custom directory {} not found", p.display()))?;
+                verify_owner_sid(dir_file.as_raw_handle() as HANDLE, user, false)?;
+                (dir_file, OsString::from(&user.username), false)
+            } else {
+                let parent = p.parent().unwrap_or_else(|| Path::new("."));
+                let parent_dir = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let parent_file = open_dir_no_reparse(parent_dir)?.with_context(|| {
+                    format!("parent directory {} not found", parent_dir.display())
+                })?;
+                verify_owner_sid(parent_file.as_raw_handle() as HANDLE, user, false)?;
+                let file_name = p
+                    .file_name()
+                    .context("invalid custom authorized_keys file path")?;
+                (parent_file, file_name.to_os_string(), true)
+            }
+        }
+        None => {
+            let (dir_path, file_name) = if user.is_admin {
+                let base = std::env::var_os("ProgramData")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+                (base.join("ssh"), "administrators_authorized_keys")
+            } else {
+                (user.home.join(".ssh"), "authorized_keys")
+            };
+            let Some(dir_file) = open_dir_no_reparse(&dir_path)? else {
+                return Ok(None);
+            };
+            (dir_file, OsString::from(file_name), false)
+        }
+    };
+
+    let Some(file) = open_child_no_reparse(&dir_file, &file_name, false)? else {
+        return Ok(None);
+    };
 
     let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        bail!("authorized_keys is a reparse point (refused)");
+    }
     if !meta.is_file() {
-        bail!("authorized_keys is not a regular file (reparse point refused)");
+        bail!("authorized_keys is not a regular file");
     }
     if meta.len() > MAX_AUTHORIZED_KEYS_BYTES {
         bail!("authorized_keys exceeds 1 MiB limit");
     }
 
-    verify_owner_sid(file.as_raw_handle() as HANDLE, user)?;
+    verify_owner_sid(file.as_raw_handle() as HANDLE, user, is_custom_file)?;
 
     let mut contents = String::new();
-    let mut reader = file;
+    let mut reader = file.take(MAX_AUTHORIZED_KEYS_BYTES + 1);
     reader.read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_AUTHORIZED_KEYS_BYTES {
+        bail!("authorized_keys exceeds 1 MiB limit");
+    }
     Ok(Some(contents))
 }
 
-fn verify_owner_sid(handle: HANDLE, user: &OsUser) -> Result<()> {
+fn verify_owner_sid(handle: HANDLE, user: &OsUser, is_custom_file: bool) -> Result<()> {
+    struct SdGuard(*mut c_void);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
     let mut owner_sid: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
     let mut sd: *mut c_void = null_mut();
     let rc = unsafe {
         GetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner_sid,
             null_mut(),
-            null_mut(),
+            &mut dacl,
             null_mut(),
             &mut sd,
         )
@@ -197,22 +403,81 @@ fn verify_owner_sid(handle: HANDLE, user: &OsUser) -> Result<()> {
     if rc != 0 {
         bail!("GetSecurityInfo failed with Win32 error {rc}");
     }
+    let _sd_guard = SdGuard(sd);
 
     let trusted = unsafe {
         let is_system = IsWellKnownSid(owner_sid, WinLocalSystemSid) != FALSE;
         let is_admins = IsWellKnownSid(owner_sid, WinBuiltinAdministratorsSid) != FALSE;
-        let is_user =
-            !user.is_admin && EqualSid(owner_sid, user.sid_bytes.as_ptr() as PSID) != FALSE;
-        is_system || is_admins || is_user
-    };
+        let is_user = EqualSid(owner_sid, user.sid_bytes.as_ptr() as PSID) != FALSE;
 
-    if !sd.is_null() {
-        unsafe { LocalFree(sd) };
-    }
+        if is_custom_file {
+            if user.is_admin {
+                is_system || is_admins
+            } else {
+                is_user
+            }
+        } else {
+            is_system || is_admins || (!user.is_admin && is_user)
+        }
+    };
 
     if !trusted {
         bail!("authorized_keys owner SID is not trusted");
     }
+
+    if dacl.is_null() {
+        bail!("authorized_keys has NULL DACL (unrestricted write access)");
+    }
+    let acl = unsafe { &*dacl };
+    for i in 0..acl.AceCount {
+        let mut ace_ptr: *mut c_void = null_mut();
+        if unsafe { GetAce(dacl, i as u32, &mut ace_ptr) } == FALSE {
+            bail!("GetAce failed to inspect DACL entry index {i}");
+        }
+        let ace_header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+        const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 17;
+        const INHERIT_ONLY_ACE: u8 = 0x08;
+
+        match ace_header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => {
+                if (ace_header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+                const WRITE_PERMS: u32 = 0x0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+                    | 0x0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+                    | 0x0010 // FILE_WRITE_EA
+                    | 0x0040 // FILE_DELETE_CHILD
+                    | 0x0100 // FILE_WRITE_ATTRIBUTES
+                    | 0x00010000 // DELETE
+                    | 0x00040000 // WRITE_DAC
+                    | 0x00080000 // WRITE_OWNER
+                    | 0x40000000 // GENERIC_WRITE
+                    | 0x10000000; // GENERIC_ALL
+
+                if (ace.Mask & WRITE_PERMS) != 0 {
+                    let ace_sid = std::ptr::addr_of!(ace.SidStart) as PSID;
+                    let ace_trusted = unsafe {
+                        IsWellKnownSid(ace_sid, WinLocalSystemSid) != FALSE
+                            || IsWellKnownSid(ace_sid, WinBuiltinAdministratorsSid) != FALSE
+                            || EqualSid(ace_sid, user.sid_bytes.as_ptr() as PSID) != FALSE
+                    };
+                    if !ace_trusted {
+                        bail!("authorized_keys DACL grants write access to untrusted principal");
+                    }
+                }
+            }
+            ACCESS_DENIED_ACE_TYPE | SYSTEM_MANDATORY_LABEL_ACE_TYPE => {}
+            other => {
+                // Reject conditional callback ACEs (e.g. ACCESS_ALLOWED_CALLBACK_ACE_TYPE = 9),
+                // compound ACEs, or object ACEs fail-closed.
+                bail!("authorized_keys DACL contains non-standard ACE type {other}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -613,4 +878,401 @@ fn from_wide_nul(buf: &[u16]) -> String {
     OsString::from_wide(&buf[..end])
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAce, AddAce, CreateWellKnownSid, InitializeAcl, WinWorldSid, ACL_REVISION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    const GENERIC_READ: u32 = 0x80000000;
+    const GENERIC_ALL: u32 = 0x10000000;
+    const FILE_WRITE_DATA: u32 = 0x0002;
+
+    fn get_test_user() -> OsUser {
+        let candidate = std::env::var("USERNAME")
+            .ok()
+            .or_else(|| std::env::var("USER").ok());
+        if let Some(ref name) = candidate {
+            if let Ok(Some(u)) = lookup_user(name) {
+                return u;
+            }
+        }
+        for fallback in &["runneradmin", "SYSTEM", "Administrator"] {
+            if let Ok(Some(u)) = lookup_user(fallback) {
+                return u;
+            }
+        }
+        panic!("could not find a valid test user via USERNAME, runneradmin, or Administrator");
+    }
+
+    fn init_acl(buf: &mut [u32]) -> *mut ACL {
+        let acl = buf.as_mut_ptr().cast::<ACL>();
+        let ok = unsafe { InitializeAcl(acl, std::mem::size_of_val(buf) as u32, ACL_REVISION) };
+        assert_ne!(ok, 0, "InitializeAcl failed");
+        acl
+    }
+
+    fn set_protected_dacl(path: &Path, acl: *const ACL) {
+        let wide = to_wide(path);
+        let ret = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            ret, 0,
+            "SetNamedSecurityInfoW failed with Win32 error {ret}"
+        );
+    }
+
+    #[test]
+    fn test_lookup_user_rejects_empty_and_nul() {
+        assert!(lookup_user("").unwrap().is_none());
+        assert!(lookup_user("user\0name").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_strict_authorized_keys_oversized_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("large_authorized_keys");
+        let large_data = vec![b'A'; (MAX_AUTHORIZED_KEYS_BYTES + 10) as usize];
+        std::fs::write(&file_path, large_data).unwrap();
+
+        let user = get_test_user();
+        let res = read_authorized_keys_strict(&user, Some(&file_path));
+        assert!(res.is_err(), "oversized keys file must be rejected");
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_valid_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("custom_authorized_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        let content = read_authorized_keys_strict(&user, Some(&file_path))
+            .expect("reading valid custom authorized_keys must succeed")
+            .expect("custom authorized_keys content must be Some");
+        assert!(content.contains("test"));
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_null_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("null_dacl_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        set_protected_dacl(&file_path, null());
+
+        let user = get_test_user();
+        let res = read_authorized_keys_strict(&user, Some(&file_path));
+        assert!(res.is_err(), "NULL DACL file must be rejected");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("NULL DACL"),
+            "expected NULL DACL error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_trusted_dacl_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("trusted_dacl_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        let mut acl_buf = vec![0u32; 256];
+        let acl = init_acl(&mut acl_buf);
+
+        let add_ok = unsafe {
+            AddAccessAllowedAce(
+                acl,
+                ACL_REVISION,
+                GENERIC_ALL,
+                user.sid_bytes.as_ptr() as PSID,
+            )
+        };
+        assert_ne!(add_ok, 0, "AddAccessAllowedAce failed");
+
+        set_protected_dacl(&file_path, acl);
+
+        let content = read_authorized_keys_strict(&user, Some(&file_path))
+            .expect("reading custom authorized_keys with trusted DACL must succeed")
+            .expect("content must be Some");
+        assert!(content.contains("test"));
+    }
+
+    fn set_untrusted_world_write_dacl(path: &Path, user: &OsUser) {
+        let mut world_sid = [0u8; 68];
+        let mut sid_size = world_sid.len() as u32;
+        let sid_ok = unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                null_mut(),
+                world_sid.as_mut_ptr() as PSID,
+                &mut sid_size,
+            )
+        };
+        assert_ne!(sid_ok, 0, "CreateWellKnownSid for WorldSid failed");
+
+        let mut acl_buf = vec![0u32; 256];
+        let acl = init_acl(&mut acl_buf);
+
+        // Ensure the trusted user can open the object so DACL inspection runs
+        let add_user_ok = unsafe {
+            AddAccessAllowedAce(
+                acl,
+                ACL_REVISION,
+                GENERIC_READ,
+                user.sid_bytes.as_ptr() as PSID,
+            )
+        };
+        assert_ne!(add_user_ok, 0, "AddAccessAllowedAce for user failed");
+
+        let add_world_ok = unsafe {
+            AddAccessAllowedAce(
+                acl,
+                ACL_REVISION,
+                FILE_WRITE_DATA,
+                world_sid.as_ptr() as PSID,
+            )
+        };
+        assert_ne!(add_world_ok, 0, "AddAccessAllowedAce for World failed");
+
+        set_protected_dacl(path, acl);
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_untrusted_write_ace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("untrusted_write_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        set_untrusted_world_write_dacl(&file_path, &user);
+
+        let res = read_authorized_keys_strict(&user, Some(&file_path));
+        assert!(res.is_err(), "untrusted write ACE must be rejected");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("grants write access to untrusted principal"),
+            "expected untrusted principal write error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_directory_mode_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("keys_dir");
+        std::fs::create_dir(&dir_path).unwrap();
+        let user = get_test_user();
+        let user_file = dir_path.join(&user.username);
+        std::fs::write(&user_file, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA dirtest\n").unwrap();
+
+        let content = read_authorized_keys_strict(&user, Some(&dir_path))
+            .expect("reading valid directory-mode authorized_keys must succeed")
+            .expect("directory-mode authorized_keys content must be Some");
+        assert!(content.contains("dirtest"));
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_directory_mode_rejects_untrusted_write_ace_on_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("keys_dir_untrusted_file");
+        std::fs::create_dir(&dir_path).unwrap();
+        let user = get_test_user();
+        let user_file = dir_path.join(&user.username);
+        std::fs::write(&user_file, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA dirtest\n").unwrap();
+
+        set_untrusted_world_write_dacl(&user_file, &user);
+
+        let res = read_authorized_keys_strict(&user, Some(&dir_path));
+        assert!(
+            res.is_err(),
+            "directory-resolved file with untrusted write ACE must be rejected"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("grants write access to untrusted principal"),
+            "expected untrusted principal write error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_directory_mode_rejects_untrusted_write_ace_on_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("keys_dir_untrusted_dir");
+        std::fs::create_dir(&dir_path).unwrap();
+        let user = get_test_user();
+        let user_file = dir_path.join(&user.username);
+        std::fs::write(&user_file, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA dirtest\n").unwrap();
+
+        set_untrusted_world_write_dacl(&dir_path, &user);
+
+        let res = read_authorized_keys_strict(&user, Some(&dir_path));
+        assert!(
+            res.is_err(),
+            "directory with untrusted write ACE must be rejected"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("grants write access to untrusted principal"),
+            "expected untrusted principal write error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_callback_ace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("callback_ace_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        let mut acl_buf = vec![0u32; 256];
+        let acl = init_acl(&mut acl_buf);
+
+        // Ensure the trusted user can open the file so DACL inspection runs
+        let add_user_ok = unsafe {
+            AddAccessAllowedAce(
+                acl,
+                ACL_REVISION,
+                GENERIC_READ,
+                user.sid_bytes.as_ptr() as PSID,
+            )
+        };
+        assert_ne!(add_user_ok, 0, "AddAccessAllowedAce for user failed");
+
+        // Append a callback ACE (ACCESS_ALLOWED_CALLBACK_ACE_TYPE = 9)
+        const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+        let sid_len = user.sid_bytes.len();
+        let ace_bytes =
+            (std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>() + sid_len + 3) & !3;
+        let mut ace_words = vec![0u32; ace_bytes / 4];
+        let header = ace_words.as_mut_ptr().cast::<ACE_HEADER>();
+        unsafe {
+            (*header).AceType = ACCESS_ALLOWED_CALLBACK_ACE_TYPE;
+            (*header).AceFlags = 0;
+            (*header).AceSize = ace_bytes as u16;
+            ace_words[1] = FILE_WRITE_DATA;
+            std::ptr::copy_nonoverlapping(
+                user.sid_bytes.as_ptr(),
+                ace_words.as_mut_ptr().add(2).cast::<u8>(),
+                sid_len,
+            );
+        }
+
+        let add_cb_ok = unsafe {
+            AddAce(
+                acl,
+                ACL_REVISION,
+                u32::MAX,
+                ace_words.as_ptr().cast(),
+                ace_bytes as u32,
+            )
+        };
+        assert_ne!(add_cb_ok, 0, "AddAce failed");
+
+        set_protected_dacl(&file_path, acl);
+
+        let res = read_authorized_keys_strict(&user, Some(&file_path));
+        assert!(res.is_err(), "callback ACE must be rejected fail-closed");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("contains non-standard ACE type 9"),
+            "expected non-standard ACE type error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_untrusted_parent_dir_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_dir = tmp.path().join("untrusted_parent");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let file_path = sub_dir.join("custom_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        set_untrusted_world_write_dacl(&sub_dir, &user);
+
+        let res = read_authorized_keys_strict(&user, Some(&file_path));
+        assert!(
+            res.is_err(),
+            "file under parent dir with untrusted write ACE must be rejected"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("grants write access to untrusted principal"),
+            "expected untrusted principal write error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_intermediate_reparse_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real_root");
+        let sub_dir = real_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let user = get_test_user();
+        let user_file = sub_dir.join(&user.username);
+        let custom_file = sub_dir.join("custom_keys");
+        std::fs::write(&user_file, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA junc\n").unwrap();
+        std::fs::write(&custom_file, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA junc\n").unwrap();
+
+        let junction_dir = tmp.path().join("junction_root");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction_dir)
+            .arg(&real_dir)
+            .status()
+            .expect("invoke cmd mklink /J");
+        assert!(status.success(), "mklink /J failed");
+
+        let direct_res = read_authorized_keys_strict(&user, Some(&junction_dir));
+        let dir_mode_res = read_authorized_keys_strict(&user, Some(&junction_dir.join("sub")));
+        let file_mode_res =
+            read_authorized_keys_strict(&user, Some(&junction_dir.join("sub").join("custom_keys")));
+
+        let _ = std::fs::remove_dir(&junction_dir);
+
+        assert!(direct_res.is_err(), "direct junction must be rejected");
+        assert!(
+            dir_mode_res.is_err(),
+            "directory mode via intermediate junction must be rejected"
+        );
+        assert!(
+            file_mode_res.is_err(),
+            "file mode via intermediate junction must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_strict_custom_authorized_keys_rejects_parent_dir_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_dir = tmp.path().join("sub");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let file_path = tmp.path().join("custom_keys");
+        std::fs::write(&file_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test\n").unwrap();
+
+        let user = get_test_user();
+        let traversal_path = sub_dir.join("..").join("custom_keys");
+        let res = read_authorized_keys_strict(&user, Some(&traversal_path));
+        assert!(res.is_err(), "'..' traversal must be rejected");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("parent directory traversal"),
+            "expected traversal error, got: {err_msg}"
+        );
+    }
 }

@@ -64,8 +64,7 @@ where
 
     Ok(Mode::Daemon {
         host_key: host_key.unwrap_or_else(platform::default_host_key_path),
-        authorized_keys: authorized_keys
-            .or_else(|| std::env::var_os("VSOCK_SSHD_AUTHORIZED_KEYS").map(PathBuf::from)),
+        authorized_keys,
     })
 }
 

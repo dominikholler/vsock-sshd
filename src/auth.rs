@@ -28,29 +28,28 @@ pub fn authorize_public_key_with_path(
         }
     };
 
-    let raw_keys = match custom_path {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                warn!(path = %path.display(), error = %err, "failed to read custom authorized_keys");
-                return None;
-            }
-        },
-        None => match platform::read_authorized_keys_strict(&user) {
-            Ok(Some(contents)) => contents,
-            Ok(None) => {
-                debug!(user = username, "no authorized_keys file found");
-                return None;
-            }
-            Err(err) => {
+    let raw_keys = match platform::read_authorized_keys_strict(&user, custom_path) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => {
+            if let Some(path) = custom_path {
                 warn!(
                     user = username,
-                    error = %err,
-                    "rejected authorized_keys due to security check"
+                    path = %path.display(),
+                    "no authorized_keys found at custom path"
                 );
-                return None;
+            } else {
+                debug!(user = username, "no authorized_keys file found");
             }
-        },
+            return None;
+        }
+        Err(err) => {
+            warn!(
+                user = username,
+                error = %err,
+                "rejected authorized_keys due to security check"
+            );
+            return None;
+        }
     };
 
     for line in raw_keys.lines() {
